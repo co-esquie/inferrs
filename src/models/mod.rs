@@ -3,6 +3,8 @@
 //! We use candle-transformers' model implementations directly, wrapping them
 //! with a unified trait for the engine to use.
 
+pub mod qwen3_5;
+
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -67,6 +69,21 @@ impl CausalLM for Gemma3Model {
     }
 }
 
+/// A Qwen3.5 model wrapper.
+struct Qwen35ModelWrapper {
+    inner: qwen3_5::Qwen35Model,
+}
+
+impl CausalLM for Qwen35ModelWrapper {
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        self.inner.forward(input_ids, seqlen_offset)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.inner.clear_kv_cache();
+    }
+}
+
 /// Load a model from weight files.
 pub fn load_model(
     raw_config: &RawConfig,
@@ -121,6 +138,19 @@ pub fn load_model(
             let model = candle_transformers::models::gemma3::Model::new(false, &config, vb)?;
             tracing::info!("Model loaded successfully");
             Ok(Box::new(Gemma3Model { inner: model }))
+        }
+        ModelArchitecture::Qwen35 => {
+            let config = raw_config.to_qwen35_config(dtype, device.clone());
+            tracing::info!(
+                "Qwen3.5 config: {} layers, {} attn heads, {} hidden, {} kv_heads",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.num_key_value_heads,
+            );
+            let model = qwen3_5::Qwen35Model::new(&config, vb)?;
+            tracing::info!("Model loaded successfully");
+            Ok(Box::new(Qwen35ModelWrapper { inner: model }))
         }
     }
 }

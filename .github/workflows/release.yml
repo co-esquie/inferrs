@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            rustflags: "-C target-feature=+fullfp16"
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            rustflags: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            rustflags: "-C target-feature=+fullfp16"
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          TARBALL="inferrs-${{ matrix.target }}.tar.gz"
+          tar -czf "$TARBALL" -C "target/${{ matrix.target }}/release" inferrs
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferrs-${{ matrix.target }}
+          path: inferrs-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create or update latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          SHA="${{ github.sha }}"
+          SHORT="${SHA::7}"
+          TAG="latest"
+
+          # Delete existing latest tag/release if present
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git -c user.email="actions@github.com" -c user.name="GitHub Actions" \
+            init && gh api repos/$GH_REPO/git/refs/tags/$TAG \
+            --method DELETE 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --title "latest (${SHORT})" \
+            --notes "Built from commit ${SHA}" \
+            --prerelease \
+            inferrs-*.tar.gz
+
+  update-formula:
+    name: Update Homebrew formula
+    needs: release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Compute SHA256s and push formula
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          SHA_MACOS=$(sha256sum inferrs-aarch64-apple-darwin.tar.gz | awk '{print $1}')
+          SHA_LINUX_X86=$(sha256sum inferrs-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+          SHA_LINUX_ARM=$(sha256sum inferrs-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+
+          BASE="https://github.com/${REPO}/releases/download/latest"
+
+          cat > inferrs.rb <<EOF
+          class Inferrs < Formula
+            desc "A conservative-memory inference engine for LLMs"
+            homepage "https://github.com/${REPO}"
+            version "${{ github.sha }}"
+            license "Apache-2.0"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "#{BASE}/inferrs-aarch64-apple-darwin.tar.gz"
+                sha256 "#{SHA_MACOS}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel?
+                url "#{BASE}/inferrs-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "#{SHA_LINUX_X86}"
+              elsif Hardware::CPU.arm?
+                url "#{BASE}/inferrs-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "#{SHA_LINUX_ARM}"
+              end
+            end
+
+            def install
+              bin.install "inferrs"
+            end
+
+            test do
+              assert_match "inferrs", shell_output("#{bin}/inferrs --help")
+            end
+          end
+          EOF
+
+          # Push to homebrew tap repo via API
+          CONTENT=$(base64 -w0 inferrs.rb)
+
+          # Get current file SHA if it exists (needed for updates)
+          FILE_SHA=$(curl -sf \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/ericcurtin/homebrew-inferrs/contents/Formula/inferrs.rb" \
+            | jq -r '.sha // empty')
+
+          PAYLOAD=$(jq -n \
+            --arg message "Update formula to ${{ github.sha }}" \
+            --arg content "$CONTENT" \
+            --arg sha "$FILE_SHA" \
+            'if $sha != "" then {message: $message, content: $content, sha: $sha}
+             else {message: $message, content: $content} end')
+
+          curl -sf -X PUT \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/ericcurtin/homebrew-inferrs/contents/Formula/inferrs.rb"

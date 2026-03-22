@@ -62,10 +62,17 @@ llama.cpp is an excellent CPU inference tool. inferrs differs in:
 
 ## Quick start
 
-### Build
+### Install
 
 ```bash
-cargo build --release
+brew tap ericcurtin/inferrs
+brew install inferrs
+```
+
+### Build from source
+
+```bash
+cargo build
 ```
 
 Enable GPU acceleration with a feature flag:

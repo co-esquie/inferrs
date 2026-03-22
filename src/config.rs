@@ -1,6 +1,7 @@
 //! Model configuration loading from config.json.
 
 use anyhow::{Context, Result};
+use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -8,8 +9,39 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelArchitecture {
     Qwen2,
+    Qwen35,
     Gemma2,
     Gemma3,
+}
+
+/// Rope parameters nested object (used in Qwen3.5 text_config).
+#[derive(Debug, Deserialize, Default)]
+pub struct RopeParameters {
+    pub rope_theta: Option<f64>,
+    pub partial_rotary_factor: Option<f64>,
+}
+
+/// Qwen3.5 text_config nested object.
+#[derive(Debug, Deserialize)]
+pub struct TextConfig {
+    pub vocab_size: Option<usize>,
+    pub hidden_size: Option<usize>,
+    pub intermediate_size: Option<usize>,
+    pub num_hidden_layers: Option<usize>,
+    pub num_attention_heads: Option<usize>,
+    pub num_key_value_heads: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub rms_norm_eps: Option<f64>,
+    pub tie_word_embeddings: Option<bool>,
+    pub full_attention_interval: Option<usize>,
+    pub linear_conv_kernel_dim: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
+    pub linear_num_key_heads: Option<usize>,
+    pub linear_num_value_heads: Option<usize>,
+    pub layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub rope_parameters: RopeParameters,
 }
 
 /// Raw config.json from HuggingFace.
@@ -45,6 +77,9 @@ pub struct RawConfig {
 
     // Gemma3-specific
     pub sliding_window_pattern: Option<usize>,
+
+    // Qwen3.5-specific (nested text_config)
+    pub text_config: Option<TextConfig>,
 }
 
 impl RawConfig {
@@ -58,6 +93,9 @@ impl RawConfig {
     pub fn detect_architecture(&self) -> Result<ModelArchitecture> {
         if let Some(archs) = &self.architectures {
             for arch in archs {
+                if arch.contains("Qwen3_5") {
+                    return Ok(ModelArchitecture::Qwen35);
+                }
                 if arch.contains("Qwen2") || arch.contains("Qwen3") {
                     return Ok(ModelArchitecture::Qwen2);
                 }
@@ -72,7 +110,8 @@ impl RawConfig {
 
         if let Some(model_type) = &self.model_type {
             match model_type.as_str() {
-                "qwen2" | "qwen2_5" | "qwen3" | "qwen3_5" => return Ok(ModelArchitecture::Qwen2),
+                "qwen2" | "qwen2_5" | "qwen3" => return Ok(ModelArchitecture::Qwen2),
+                "qwen3_5" => return Ok(ModelArchitecture::Qwen35),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
                 "gemma2" => return Ok(ModelArchitecture::Gemma2),
                 _ => {}
@@ -160,6 +199,81 @@ impl RawConfig {
         }
     }
 
+    pub fn to_qwen35_config(
+        &self,
+        dtype: DType,
+        device: Device,
+    ) -> crate::models::qwen3_5::Qwen35Config {
+        use crate::models::qwen3_5::{LayerType, Qwen35Config};
+
+        // All model params live in the nested text_config
+        let tc = self.text_config.as_ref();
+
+        let vocab_size = tc.and_then(|t| t.vocab_size).unwrap_or(248320);
+        let hidden_size = tc.and_then(|t| t.hidden_size).unwrap_or(1024);
+        let intermediate_size = tc.and_then(|t| t.intermediate_size).unwrap_or(3584);
+        let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(24);
+        let num_attention_heads = tc.and_then(|t| t.num_attention_heads).unwrap_or(8);
+        let num_key_value_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(2);
+        let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
+        let rms_norm_eps = tc.and_then(|t| t.rms_norm_eps).unwrap_or(1e-6);
+        let tie_word_embeddings = tc.and_then(|t| t.tie_word_embeddings).unwrap_or(true);
+        let full_attention_interval = tc.and_then(|t| t.full_attention_interval).unwrap_or(4);
+        let linear_conv_kernel_dim = tc.and_then(|t| t.linear_conv_kernel_dim).unwrap_or(4);
+        let linear_key_head_dim = tc.and_then(|t| t.linear_key_head_dim).unwrap_or(128);
+        let linear_value_head_dim = tc.and_then(|t| t.linear_value_head_dim).unwrap_or(128);
+        let linear_num_key_heads = tc.and_then(|t| t.linear_num_key_heads).unwrap_or(16);
+        let linear_num_value_heads = tc.and_then(|t| t.linear_num_value_heads).unwrap_or(16);
+
+        let rope_theta = tc
+            .map(|t| t.rope_parameters.rope_theta.unwrap_or(10_000_000.0))
+            .unwrap_or(10_000_000.0);
+        let partial_rotary_factor = tc
+            .map(|t| t.rope_parameters.partial_rotary_factor.unwrap_or(0.25))
+            .unwrap_or(0.25);
+
+        // Build layer_types from the string list in text_config
+        let layer_types: Vec<LayerType> =
+            if let Some(types) = tc.and_then(|t| t.layer_types.as_ref()) {
+                types
+                    .iter()
+                    .map(|s| LayerType {
+                        is_full_attention: s == "full_attention",
+                    })
+                    .collect()
+            } else {
+                // Fall back to computing from full_attention_interval
+                (0..num_hidden_layers)
+                    .map(|i| LayerType {
+                        is_full_attention: (i + 1) % full_attention_interval == 0,
+                    })
+                    .collect()
+            };
+
+        Qwen35Config {
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            linear_num_key_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            linear_num_value_heads,
+            linear_conv_kernel_dim,
+            full_attention_interval,
+            rms_norm_eps,
+            rope_theta,
+            partial_rotary_factor,
+            layer_types,
+            tie_word_embeddings,
+            dtype,
+            device,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn max_seq_len(&self) -> usize {
         self.max_position_embeddings.unwrap_or(4096)
@@ -205,6 +319,7 @@ mod tests {
             attn_logit_softcapping: None,
             query_pre_attn_scalar: None,
             sliding_window_pattern: None,
+            text_config: None,
         }
     }
 
