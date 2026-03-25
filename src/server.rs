@@ -20,6 +20,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::config::RawConfig;
 use crate::engine::{EngineRequest, GenerationResult, StreamToken};
+use crate::kv_cache::{BlockPool, PagedCacheConfig, PagedKvStore};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Tokenizer};
 use crate::ServeArgs;
@@ -138,6 +139,8 @@ struct AppState {
     engine_tx: mpsc::Sender<EngineRequest>,
     tokenizer: Arc<Tokenizer>,
     default_params: SamplingParams,
+    /// Hard upper bound on (prompt_tokens + output_tokens) for this model.
+    max_seq_len: usize,
 }
 
 // ─── Server startup ─────────────────────────────────────────────────────────
@@ -170,6 +173,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         &device,
     )?;
 
+    // Effective sequence-length cap for this model.
+    let max_seq_len = raw_config.effective_max_seq_len(&arch);
+    if max_seq_len < usize::MAX {
+        tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
+    }
+
     // Default sampling params from CLI args
     let default_params = SamplingParams {
         temperature: args.temperature,
@@ -183,17 +192,67 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
 
     // Spawn engine on a dedicated thread
-    let engine = crate::engine::Engine::new(
+    let mut engine = crate::engine::Engine::new(
         model,
         // The engine needs its own tokenizer for decoding
         Tokenizer::from_file(
             &model_files.tokenizer_path,
             model_files.tokenizer_config_path.as_deref(),
         )?,
-        device,
+        device.clone(),
         args.max_batch_size,
         args.max_tokens_per_step,
     );
+
+    // If --paged-attention <fraction> was given, set up the paged KV store.
+    if let Some(memory_fraction) = args.paged_attention {
+        let bytes_per_element = match dtype {
+            candle_core::DType::F32 => 4,
+            _ => 2, // f16 / bf16
+        };
+
+        // Estimate available device memory.  Candle does not expose a device
+        // memory query API, so we use a conservative platform heuristic:
+        //   CUDA / Metal  → 8 GiB
+        //   CPU           → 4 GiB
+        // The user-supplied fraction then scales this down to the actual
+        // allocation, e.g. 0.6 × 8 GiB = 4.8 GiB for KV blocks.
+        let total_memory_bytes: usize = match &device {
+            candle_core::Device::Cuda(_) | candle_core::Device::Metal(_) => 8 * 1024 * 1024 * 1024,
+            _ => 4 * 1024 * 1024 * 1024,
+        };
+
+        let (num_kv_heads, head_dim, num_kv_layers) = raw_config.kv_cache_params(&arch);
+
+        tracing::info!(
+            "Paged attention: fraction={:.2}, {} KV heads, head_dim={}, {} KV layers",
+            memory_fraction,
+            num_kv_heads,
+            head_dim,
+            num_kv_layers,
+        );
+
+        let paged_cfg = PagedCacheConfig::from_memory_fraction(
+            total_memory_bytes,
+            memory_fraction,
+            args.block_size,
+            num_kv_heads,
+            head_dim,
+            num_kv_layers,
+            bytes_per_element,
+        );
+
+        tracing::info!(
+            "Paged KV store: {} blocks × {} tokens/block = {} total slots",
+            paged_cfg.num_blocks,
+            paged_cfg.block_size,
+            paged_cfg.num_blocks * paged_cfg.block_size,
+        );
+
+        let block_pool = BlockPool::new(paged_cfg.num_blocks, paged_cfg.block_size);
+        let kv_store = PagedKvStore::new(paged_cfg, dtype, &device)?;
+        engine = engine.with_paged_kv(block_pool, kv_store);
+    }
 
     std::thread::Builder::new()
         .name("engine".to_string())
@@ -206,6 +265,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         engine_tx,
         tokenizer,
         default_params,
+        max_seq_len,
     });
 
     // Build router
@@ -265,7 +325,12 @@ async fn chat_completions(
         prompt_tokens.len()
     );
 
-    // Build sampling params
+    // Build sampling params, clamping max_tokens to the model's KV cache capacity.
+    let requested_max_tokens = req
+        .max_completion_tokens
+        .or(req.max_tokens)
+        .unwrap_or(state.default_params.max_tokens);
+    let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(state.default_params.temperature),
         top_p: req.top_p.unwrap_or(state.default_params.top_p),
@@ -273,10 +338,7 @@ async fn chat_completions(
         repetition_penalty: req
             .repetition_penalty
             .unwrap_or(state.default_params.repetition_penalty),
-        max_tokens: req
-            .max_completion_tokens
-            .or(req.max_tokens)
-            .unwrap_or(state.default_params.max_tokens),
+        max_tokens,
     };
 
     let is_stream = req.stream.unwrap_or(false);
@@ -483,6 +545,8 @@ async fn completions(
         }
     };
 
+    let requested_max_tokens = req.max_tokens.unwrap_or(state.default_params.max_tokens);
+    let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(state.default_params.temperature),
         top_p: req.top_p.unwrap_or(state.default_params.top_p),
@@ -490,7 +554,7 @@ async fn completions(
         repetition_penalty: req
             .repetition_penalty
             .unwrap_or(state.default_params.repetition_penalty),
-        max_tokens: req.max_tokens.unwrap_or(state.default_params.max_tokens),
+        max_tokens,
     };
 
     let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
@@ -565,4 +629,24 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRespon
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// Clamp `requested` so that `prompt_len + result <= max_seq_len`.
+///
+/// Returns `requested` unchanged when `max_seq_len` is `usize::MAX` (no cap).
+fn clamp_max_tokens(requested: usize, prompt_len: usize, max_seq_len: usize) -> usize {
+    if max_seq_len == usize::MAX {
+        return requested;
+    }
+    let available = max_seq_len.saturating_sub(prompt_len);
+    if requested > available {
+        tracing::warn!(
+            "Clamping max_tokens from {} to {} (model KV cache capacity: {} tokens, prompt: {})",
+            requested,
+            available,
+            max_seq_len,
+            prompt_len,
+        );
+    }
+    requested.min(available)
 }

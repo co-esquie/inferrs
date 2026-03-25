@@ -4,6 +4,7 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::kv_cache::{BlockPool, BlockTable, PagedKvStore};
 use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
@@ -56,6 +57,16 @@ pub struct Engine {
     max_batch_size: usize,
     #[allow(dead_code)]
     max_tokens_per_step: usize,
+    /// When `Some`, paged-attention is active.
+    paged: Option<PagedState>,
+}
+
+/// State needed for paged-attention mode.
+struct PagedState {
+    block_pool: BlockPool,
+    kv_store: PagedKvStore,
+    /// Per-request block table, reset at the start of each request.
+    block_table: BlockTable,
 }
 
 impl Engine {
@@ -74,7 +85,19 @@ impl Engine {
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step,
+            paged: None,
         }
+    }
+
+    /// Attach a paged KV store to this engine, enabling paged-attention mode.
+    pub fn with_paged_kv(mut self, block_pool: BlockPool, kv_store: PagedKvStore) -> Self {
+        let block_size = block_pool.block_size;
+        self.paged = Some(PagedState {
+            block_pool,
+            kv_store,
+            block_table: BlockTable::new(block_size),
+        });
+        self
     }
 
     /// Run the engine loop, processing requests from the channel.
@@ -126,7 +149,54 @@ impl Engine {
         tracing::info!("Engine loop stopped");
     }
 
-    /// Non-streaming generation.
+    // ── Paged-attention helpers ───────────────────────────────────────────────
+
+    /// Allocate paged slots for `count` consecutive positions starting at
+    /// `start_pos`.  Returns an error if the pool is exhausted.
+    fn paged_alloc_range(ps: &mut PagedState, start_pos: usize, count: usize) -> Result<()> {
+        for pos in start_pos..start_pos + count {
+            if !ps.block_table.ensure_allocated(pos, &mut ps.block_pool) {
+                anyhow::bail!("paged attention: out of KV blocks at position {}", pos);
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a prefill forward pass through the paged KV store.
+    fn paged_prefill(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        prompt_tokens: &[u32],
+        ps: &mut PagedState,
+    ) -> Result<Tensor> {
+        Self::paged_alloc_range(ps, 0, prompt_tokens.len())?;
+        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
+        model.forward_paged(&input_ids, 0, &ps.block_table, &mut ps.kv_store)
+    }
+
+    /// Run a single decode step through the paged KV store.
+    fn paged_decode_step(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        token_id: u32,
+        seqlen_offset: usize,
+        ps: &mut PagedState,
+    ) -> Result<Tensor> {
+        if !ps
+            .block_table
+            .ensure_allocated(seqlen_offset, &mut ps.block_pool)
+        {
+            anyhow::bail!(
+                "paged attention: out of KV blocks at position {}",
+                seqlen_offset
+            );
+        }
+        let input_ids = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
+        model.forward_paged(&input_ids, seqlen_offset, &ps.block_table, &mut ps.kv_store)
+    }
+
+    // ── Non-streaming generation ──────────────────────────────────────────────
+
     fn generate(
         &mut self,
         request_id: &str,
@@ -140,40 +210,47 @@ impl Engine {
             sampling_params.max_tokens
         );
 
-        // Clear KV cache for new sequence
-        self.model.clear_kv_cache();
-
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
-        // Prefill: process all prompt tokens at once
-        let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_ids, 0)?;
+        let logits = if let Some(ps) = &mut self.paged {
+            // ── Paged path ────────────────────────────────────────────────────
+            ps.block_table.free_all(&mut ps.block_pool);
+            self.model.clear_kv_cache();
+            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
+        } else {
+            // ── Concat-KV path ────────────────────────────────────────────────
+            self.model.clear_kv_cache();
+            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            self.model.forward(&input_ids, 0)?
+        };
 
-        // Sample first token
         let mut token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
         all_tokens.push(token_id);
 
-        // Check for immediate stop
         let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-        // Decode loop: generate one token at a time
         while finish_reason.is_none() {
-            let input_ids = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits = self.model.forward(&input_ids, seqlen_offset)?;
+            let logits = if let Some(ps) = &mut self.paged {
+                Self::paged_decode_step(&mut self.model, &self.device, token_id, seqlen_offset, ps)?
+            } else {
+                let input_ids = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
+                self.model.forward(&input_ids, seqlen_offset)?
+            };
 
             token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
             all_tokens.push(token_id);
-
             finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
         }
 
-        let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
+        if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+        }
 
-        // Decode output tokens to text
+        let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
         let output_text = self.tokenizer.decode(&output_tokens, true)?;
 
         tracing::debug!(
@@ -192,7 +269,8 @@ impl Engine {
         })
     }
 
-    /// Streaming generation.
+    // ── Streaming generation ──────────────────────────────────────────────────
+
     fn generate_stream(
         &mut self,
         request_id: &str,
@@ -206,17 +284,20 @@ impl Engine {
             prompt_tokens.len()
         );
 
-        // Clear KV cache for new sequence
-        self.model.clear_kv_cache();
-
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
         // Prefill
-        let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_ids, 0)?;
+        let logits = if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+            self.model.clear_kv_cache();
+            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
+        } else {
+            self.model.clear_kv_cache();
+            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            self.model.forward(&input_ids, 0)?
+        };
 
-        // Sample first token
         let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
         all_tokens.push(token_id);
@@ -231,20 +312,31 @@ impl Engine {
                 finish_reason: finish_reason.clone(),
             })
             .is_err()
+            || finish_reason.is_some()
         {
-            return Ok(()); // Client disconnected
-        }
-
-        if finish_reason.is_some() {
+            if let Some(ps) = &mut self.paged {
+                ps.block_table.free_all(&mut ps.block_pool);
+            }
             return Ok(());
         }
 
         // Decode loop
         loop {
             let last_token = *output_tokens.last().unwrap();
-            let input_ids = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits = self.model.forward(&input_ids, seqlen_offset)?;
+
+            let logits = if let Some(ps) = &mut self.paged {
+                Self::paged_decode_step(
+                    &mut self.model,
+                    &self.device,
+                    last_token,
+                    seqlen_offset,
+                    ps,
+                )?
+            } else {
+                let input_ids = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
+                self.model.forward(&input_ids, seqlen_offset)?
+            };
 
             let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
@@ -260,16 +352,92 @@ impl Engine {
                     finish_reason: finish_reason.clone(),
                 })
                 .is_err()
+                || finish_reason.is_some()
             {
-                return Ok(()); // Client disconnected
-            }
-
-            if finish_reason.is_some() {
                 break;
             }
         }
 
+        if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+        }
+
         Ok(())
+    }
+
+    // ── Benchmark generation ──────────────────────────────────────────────────
+
+    /// Run a single generation and return the result plus timing breakdown.
+    ///
+    /// Returns `(result, prefill_ms, decode_ms)` where:
+    /// - `prefill_ms` is the wall time for the prefill forward pass
+    /// - `decode_ms`  is the wall time for all decode steps combined
+    pub fn bench_generate(
+        &mut self,
+        _request_id: &str,
+        prompt_tokens: &[u32],
+        sampling_params: &SamplingParams,
+    ) -> Result<(GenerationResult, f64, f64)> {
+        use std::time::Instant;
+
+        let mut output_tokens: Vec<u32> = Vec::new();
+        let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+
+        let prefill_start = Instant::now();
+
+        let logits = if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+            self.model.clear_kv_cache();
+            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
+        } else {
+            self.model.clear_kv_cache();
+            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            self.model.forward(&input_ids, 0)?
+        };
+
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+        output_tokens.push(token_id);
+        all_tokens.push(token_id);
+
+        let decode_start = Instant::now();
+        let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+
+        while finish_reason.is_none() {
+            let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
+            let logits = if let Some(ps) = &mut self.paged {
+                Self::paged_decode_step(&mut self.model, &self.device, token_id, seqlen_offset, ps)?
+            } else {
+                let input_ids = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
+                self.model.forward(&input_ids, seqlen_offset)?
+            };
+            token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+            output_tokens.push(token_id);
+            all_tokens.push(token_id);
+            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+        }
+
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+        }
+
+        let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
+        let output_text = self.tokenizer.decode(&output_tokens, true)?;
+
+        Ok((
+            GenerationResult {
+                prompt_tokens: prompt_tokens.len(),
+                completion_tokens: output_tokens.len(),
+                output_token_ids: output_tokens,
+                output_text,
+                finish_reason,
+            },
+            prefill_ms,
+            decode_ms,
+        ))
     }
 
     fn check_stop(

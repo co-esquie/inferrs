@@ -11,6 +11,21 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
+use crate::kv_cache::{BlockTable, PagedKvStore};
+
+/// Paged-attention context passed down to each layer's `forward_paged` call.
+///
+/// Grouping these together keeps individual method signatures within clippy's
+/// argument-count limit and makes call sites cleaner.
+pub struct PagedCtx<'a> {
+    pub cos: &'a Tensor,
+    pub sin: &'a Tensor,
+    pub block_table: &'a BlockTable,
+    pub kv_store: &'a mut PagedKvStore,
+    /// Index into the paged KV store (counts only full-attention layers).
+    pub layer_idx: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -302,6 +317,123 @@ impl FullAttention {
 
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+    }
+
+    /// Paged-attention forward pass.
+    ///
+    /// Instead of growing a per-layer concat KV cache, keys and values are
+    /// written into `kv_store` at the physical slots resolved from `block_table`.
+    /// All previously written slots for this sequence are then gathered and used
+    /// as the full KV context.
+    ///
+    /// `seqlen_offset` is the number of tokens already processed (i.e. the
+    /// position of the *first* token in the current `x` batch).
+    /// Paged-attention context (cos/sin/block_table/kv_store/layer_idx) is
+    /// bundled in `ctx` to keep the argument count manageable.
+    fn forward_paged(
+        &self,
+        x: &Tensor,
+        seqlen_offset: usize,
+        ctx: &mut PagedCtx,
+    ) -> Result<Tensor> {
+        let (b, t, _) = x.dims3()?;
+
+        // ── Project ──────────────────────────────────────────────────────────
+        let q_full = self.q_proj.forward(x)?;
+        let attn_dim = self.num_heads * self.head_dim;
+        let q_raw = q_full.narrow(2, 0, attn_dim)?;
+        let gate = q_full.narrow(2, attn_dim, attn_dim)?;
+
+        let k_proj_out = self.k_proj.forward(x)?; // [b, t, num_kv_heads * head_dim]
+        let v_proj_out = self.v_proj.forward(x)?;
+
+        // Reshape to [b, heads, t, head_dim]
+        let q = q_raw
+            .reshape((b, t, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k_proj_out
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v_proj_out
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // ── QK-norm ──────────────────────────────────────────────────────────
+        let q = apply_rms_norm_heads(&q, &self.q_norm)?;
+        let k = apply_rms_norm_heads(&k, &self.k_norm)?;
+
+        // ── RoPE ─────────────────────────────────────────────────────────────
+        let cos_slice = ctx.cos.narrow(0, seqlen_offset, t)?;
+        let sin_slice = ctx.sin.narrow(0, seqlen_offset, t)?;
+        let q = apply_rope(&q, &cos_slice, &sin_slice)?;
+        let k = apply_rope(&k, &cos_slice, &sin_slice)?;
+
+        // ── Write new K/V into the paged store ───────────────────────────────
+        for ti in 0..t {
+            let position = seqlen_offset + ti;
+            let slot_id = ctx.block_table.slot_for(position).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "paged attention: no slot allocated for position {}",
+                    position
+                )
+            })?;
+            let k_tok = k.narrow(2, ti, 1)?.squeeze(2)?.squeeze(0)?;
+            let v_tok = v.narrow(2, ti, 1)?.squeeze(2)?.squeeze(0)?;
+            ctx.kv_store
+                .write_slot(ctx.layer_idx, slot_id as usize, &k_tok, &v_tok)?;
+        }
+
+        // ── Gather full K/V context for this sequence ─────────────────────────
+        let total_tokens = seqlen_offset + t;
+        let slot_ids: Vec<u32> = (0..total_tokens)
+            .map(|pos| {
+                ctx.block_table.slot_for(pos).ok_or_else(|| {
+                    anyhow::anyhow!("paged attention: missing slot for position {}", pos)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (k_full, v_full) = ctx.kv_store.gather_slots(ctx.layer_idx, &slot_ids)?;
+
+        // Reshape to [b, num_kv_heads, kv_len, head_dim]  (b == 1)
+        let kv_len = total_tokens;
+        let k_full = k_full
+            .reshape((b, kv_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v_full = v_full
+            .reshape((b, kv_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // ── GQA expand ───────────────────────────────────────────────────────
+        let groups = self.num_heads / self.num_kv_heads;
+        let k_full = k_full.repeat(&[1, groups, 1, 1])?;
+        let v_full = v_full.repeat(&[1, groups, 1, 1])?;
+
+        // ── Scaled dot-product attention ─────────────────────────────────────
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = q
+            .contiguous()?
+            .matmul(&k_full.transpose(2, 3)?.contiguous()?)?
+            .affine(1.0 / scale, 0.0)?;
+
+        let attn = if t > 1 {
+            let mask = causal_mask(t, kv_len, seqlen_offset, attn.device(), attn.dtype())?;
+            attn.broadcast_add(&mask)?
+        } else {
+            attn
+        };
+
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&v_full.contiguous()?)?;
+
+        // ── Reshape + output gate ─────────────────────────────────────────────
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, t, self.num_heads * self.head_dim))?;
+        let gate_sig = (gate.neg()?.exp()? + 1.0)?.recip()?;
+        let out = out.broadcast_mul(&gate_sig)?;
+
+        self.o_proj.forward(&out).map_err(Into::into)
     }
 }
 
@@ -774,6 +906,37 @@ impl DecoderLayer {
         (residual + mlp_out).map_err(Into::into)
     }
 
+    /// Paged-attention forward pass.
+    ///
+    /// For full-attention layers, delegates to `FullAttention::forward_paged`.
+    /// For linear-attention (SSM) layers, falls back to the standard path since
+    /// SSM layers maintain their own recurrent state (not a KV cache) and do not
+    /// participate in paged attention.
+    ///
+    /// `ctx.layer_idx` is the index into the paged KV store (counting only
+    /// full-attention layers, not all decoder layers).
+    fn forward_paged(
+        &mut self,
+        x: &Tensor,
+        seqlen_offset: usize,
+        ctx: &mut PagedCtx,
+    ) -> Result<Tensor> {
+        let residual = x.clone();
+        let normed = self.input_layernorm.forward(x)?;
+
+        let attn_out = match &mut self.attn {
+            LayerAttn::Full(a) => a.forward_paged(&normed, seqlen_offset, ctx)?,
+            // SSM layers are not paged — use their standard recurrent path.
+            LayerAttn::Linear(a) => a.forward(&normed)?,
+        };
+
+        let x = (residual + attn_out)?;
+        let residual = x.clone();
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        (residual + mlp_out).map_err(Into::into)
+    }
+
     fn clear_cache(&mut self) {
         match &mut self.attn {
             LayerAttn::Full(a) => a.clear_kv_cache(),
@@ -865,6 +1028,52 @@ impl Qwen35Model {
         let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
         let logits = logits.unsqueeze(1)?; // [b, 1, vocab]
         Ok(logits)
+    }
+
+    /// Paged-attention forward pass.
+    ///
+    /// Behaves identically to `forward` but uses the vLLM-style paged KV store
+    /// instead of per-layer concat caches for full-attention layers.
+    ///
+    /// `block_table` maps this sequence's logical block indices to physical
+    /// slots in `kv_store`.  The caller is responsible for ensuring that all
+    /// positions `0..seqlen_offset + seq_len` have been allocated in the block
+    /// table before calling this method.
+    pub fn forward_paged(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+    ) -> Result<Tensor> {
+        let (_b, t) = input_ids.dims2()?;
+
+        let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
+
+        // Track which full-attention layer we are visiting so we index the
+        // correct slice of kv_store.
+        let mut full_attn_idx = 0usize;
+        for layer in &mut self.layers {
+            let is_full = matches!(layer.attn, LayerAttn::Full(_));
+            let mut ctx = PagedCtx {
+                cos: &self.cos,
+                sin: &self.sin,
+                block_table,
+                kv_store,
+                layer_idx: full_attn_idx,
+            };
+            x = layer.forward_paged(&x, seqlen_offset, &mut ctx)?;
+            if is_full {
+                full_attn_idx += 1;
+            }
+        }
+
+        x = self.norm.forward(&x)?;
+
+        let last = x.narrow(1, t - 1, 1)?;
+        let last_2d = last.squeeze(1)?.contiguous()?;
+        let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?;
+        logits.unsqueeze(1).map_err(Into::into)
     }
 
     pub fn clear_kv_cache(&mut self) {

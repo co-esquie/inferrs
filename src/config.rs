@@ -274,9 +274,83 @@ impl RawConfig {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn max_seq_len(&self) -> usize {
-        self.max_position_embeddings.unwrap_or(4096)
+    /// Return the effective maximum sequence length that the model's KV cache
+    /// can hold.
+    ///
+    /// For Gemma3, the upstream candle-transformers implementation sizes **all**
+    /// KV caches (both sliding-window and non-sliding layers) to
+    /// `sliding_window` tokens.  Any attempt to generate beyond that limit
+    /// causes an opaque tensor error.  We therefore report `sliding_window` as
+    /// the hard limit for Gemma3, not `max_position_embeddings`.
+    pub fn effective_max_seq_len(&self, arch: &ModelArchitecture) -> usize {
+        match arch {
+            ModelArchitecture::Gemma3 => {
+                // The KvCache is capped at sliding_window in candle-transformers.
+                self.sliding_window.unwrap_or(512)
+            }
+            ModelArchitecture::Gemma2 => self.max_position_embeddings.unwrap_or(8192),
+            ModelArchitecture::Qwen2 => self.max_position_embeddings.unwrap_or(131072),
+            ModelArchitecture::Qwen35 => {
+                let tc = self.text_config.as_ref();
+                // Qwen3.5 uses linear attention for most layers; the full-attn
+                // layers have no artificial cap.
+                tc.and_then(|t| t.num_hidden_layers)
+                    .map(|_| usize::MAX) // effectively unlimited
+                    .unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    /// Return `(num_kv_heads, head_dim, num_full_attn_layers)` for paged KV
+    /// cache sizing.  `num_full_attn_layers` is the number of layers whose KV
+    /// pairs are stored in the paged store (full-attention layers only; SSM
+    /// layers are excluded).
+    pub fn kv_cache_params(&self, arch: &ModelArchitecture) -> (usize, usize, usize) {
+        match arch {
+            ModelArchitecture::Qwen35 => {
+                let tc = self.text_config.as_ref();
+                let num_kv_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(2);
+                let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
+                let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(24);
+                let full_attention_interval =
+                    tc.and_then(|t| t.full_attention_interval).unwrap_or(4);
+                // Count full-attention layers from layer_types list if present.
+                let num_full_attn = if let Some(types) = tc.and_then(|t| t.layer_types.as_ref()) {
+                    types
+                        .iter()
+                        .filter(|s| s.as_str() == "full_attention")
+                        .count()
+                } else {
+                    // Fallback: every full_attention_interval-th layer is full-attention.
+                    (0..num_hidden_layers)
+                        .filter(|i| (i + 1) % full_attention_interval == 0)
+                        .count()
+                };
+                (num_kv_heads, head_dim, num_full_attn)
+            }
+            ModelArchitecture::Qwen2 => {
+                let num_kv_heads = self.num_key_value_heads.unwrap_or(2);
+                let num_attention_heads = self.num_attention_heads.unwrap_or(14);
+                let hidden_size = self.hidden_size.unwrap_or(896);
+                let head_dim = hidden_size / num_attention_heads;
+                let num_layers = self.num_hidden_layers.unwrap_or(24);
+                (num_kv_heads, head_dim, num_layers)
+            }
+            ModelArchitecture::Gemma2 => {
+                let num_kv_heads = self.num_key_value_heads.unwrap_or(8);
+                let num_attention_heads = self.num_attention_heads.unwrap_or(16);
+                let hidden_size = self.hidden_size.unwrap_or(3584);
+                let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
+                let num_layers = self.num_hidden_layers.unwrap_or(42);
+                (num_kv_heads, head_dim, num_layers)
+            }
+            ModelArchitecture::Gemma3 => {
+                let num_kv_heads = self.num_key_value_heads.unwrap_or(4);
+                let head_dim = self.head_dim.unwrap_or(256);
+                let num_layers = self.num_hidden_layers.unwrap_or(34);
+                (num_kv_heads, head_dim, num_layers)
+            }
+        }
     }
 }
 

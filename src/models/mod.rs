@@ -11,11 +11,28 @@ use candle_nn::VarBuilder;
 use std::path::Path;
 
 use crate::config::{ModelArchitecture, RawConfig};
+use crate::kv_cache::{BlockTable, PagedKvStore};
+
 /// Unified model interface for the engine.
 pub trait CausalLM: Send {
     /// Run a forward pass on the given input token IDs.
     /// Returns logits for the last token position: shape (batch_size, 1, vocab_size).
     fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor>;
+
+    /// Run a paged-attention forward pass.
+    ///
+    /// The default implementation falls back to `forward`, ignoring the paged
+    /// store.  Models that support paged attention override this.
+    fn forward_paged(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+    ) -> Result<Tensor> {
+        let _ = (block_table, kv_store); // unused in default impl
+        self.forward(input_ids, seqlen_offset)
+    }
 
     /// Clear all KV caches (for starting a new sequence).
     fn clear_kv_cache(&mut self);
@@ -77,6 +94,17 @@ struct Qwen35ModelWrapper {
 impl CausalLM for Qwen35ModelWrapper {
     fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         self.inner.forward(input_ids, seqlen_offset)
+    }
+
+    fn forward_paged(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+    ) -> Result<Tensor> {
+        self.inner
+            .forward_paged(input_ids, seqlen_offset, block_table, kv_store)
     }
 
     fn clear_kv_cache(&mut self) {

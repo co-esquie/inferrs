@@ -1,3 +1,4 @@
+mod bench;
 mod config;
 mod engine;
 mod hub;
@@ -23,6 +24,8 @@ struct Cli {
 enum Commands {
     /// Serve a model from HuggingFace Hub
     Serve(ServeArgs),
+    /// Benchmark inference throughput and latency
+    Bench(bench::BenchArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -89,6 +92,13 @@ pub struct ServeArgs {
     /// Default max tokens to generate
     #[arg(long, default_value_t = 2048)]
     pub max_tokens: usize,
+
+    /// Enable paged attention KV cache (vLLM-style block management).
+    /// Specify the fraction of GPU/CPU memory to reserve for KV blocks,
+    /// e.g. `--paged-attention 0.6` reserves 60% of available memory.
+    /// When unset (the default) the standard concat-based KV cache is used.
+    #[arg(long)]
+    pub paged_attention: Option<f64>,
 }
 
 impl ServeArgs {
@@ -144,6 +154,10 @@ async fn main() -> Result<()> {
         Commands::Serve(args) => {
             tracing::info!("Starting inferrs server for model: {}", args.model);
             server::run(args).await?;
+        }
+        Commands::Bench(args) => {
+            tracing::info!("Running benchmark for model: {}", args.serve.model);
+            bench::run(args)?;
         }
     }
 
