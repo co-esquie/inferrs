@@ -272,15 +272,15 @@ impl TurboQuantCodec {
         let inv_norm = if norm > 1e-12 { 1.0 / norm } else { 1.0 };
 
         // Rotate: y = Π · (x / norm)   [shape d]
+        // Each coordinate of the rotated unit vector follows N(0, 1/d), so
+        // scale by √d to map to N(0,1) before applying the codebook.
+        let sqrt_d = (d as f32).sqrt();
         let y: Vec<f32> = self
             .rotation
             .chunks_exact(d)
             .map(|row| {
-                // Scale the rotated coordinate so it's on the unit sphere:
-                // we divide x by norm first (conceptually), but the rotation is
-                // linear so we can multiply by inv_norm after.
                 let acc: f32 = row.iter().zip(x.iter()).map(|(r, xi)| r * xi).sum();
-                acc * inv_norm
+                acc * inv_norm * sqrt_d
             })
             .collect();
 
@@ -323,8 +323,9 @@ impl TurboQuantCodec {
             .map(|&i| self.centroids[i as usize])
             .collect();
 
-        // Apply inverse rotation: x̃ = Π⊤ · y  (Π is orthogonal so Π⁻¹ = Π⊤)
-        // Π⊤[i,j] = Π[j,i], so x[i] = Σ_j rotation[j*d + i] * y[j]
+        // Apply inverse rotation: x̃ = Π⊤ · (y / √d) · norm
+        // We stored y scaled by √d, so divide back out before rotating.
+        let sqrt_d = (d as f32).sqrt();
         (0..d)
             .map(|i| {
                 let acc: f32 = y
@@ -332,7 +333,7 @@ impl TurboQuantCodec {
                     .enumerate()
                     .map(|(j, &yj)| self.rotation[j * d + i] * yj)
                     .sum();
-                acc * norm
+                acc * norm / sqrt_d
             })
             .collect()
     }
@@ -443,12 +444,17 @@ impl TurboQuantKvCache {
         let k_f32 = k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let v_f32 = v.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
 
-        // Flatten to [num_kv_heads * seq_len, head_dim].
+        // Transpose to [seq_len, num_kv_heads, head_dim] then flatten to
+        // [seq_len * num_kv_heads, head_dim] so tokens are stored position-major:
+        // [t0_h0, t0_h1, ..., t0_hM, t1_h0, ...].  This matches the decode
+        // step which appends one position at a time across all heads.
         let k_data = k_f32
-            .reshape((self.num_kv_heads * seq_len, head_dim))?
+            .transpose(1, 2)? // [1, seq_len, num_kv_heads, head_dim]
+            .reshape((seq_len * self.num_kv_heads, head_dim))?
             .to_vec2::<f32>()?;
         let v_data = v_f32
-            .reshape((self.num_kv_heads * seq_len, head_dim))?
+            .transpose(1, 2)?
+            .reshape((seq_len * self.num_kv_heads, head_dim))?
             .to_vec2::<f32>()?;
 
         for (kv, vv) in k_data.iter().zip(v_data.iter()) {
@@ -463,10 +469,10 @@ impl TurboQuantKvCache {
     ///
     /// Output shapes: `[1, num_kv_heads, total_seq_len, head_dim]`
     pub fn dequantize(&self) -> Result<(Tensor, Tensor)> {
-        let num_tokens_per_head = self.k_tokens.len() / self.num_kv_heads;
+        // Tokens are stored position-major: [t0_h0, t0_h1, ..., tN_hM]
+        let seq_len = self.k_tokens.len() / self.num_kv_heads;
         let head_dim = self.codec.head_dim;
-
-        let total = self.k_tokens.len(); // num_kv_heads * total_seq_len
+        let total = self.k_tokens.len();
 
         // Dequantize all tokens to f32 flat arrays — in parallel across tokens.
         let mut k_flat = vec![0.0f32; total * head_dim];
@@ -485,19 +491,24 @@ impl TurboQuantKvCache {
                 chunk.copy_from_slice(&self.codec.dequantize_vec(v_idx, *v_norm));
             });
 
-        // Build tensors: [num_kv_heads * total_seq_len, head_dim] → [1, num_kv_heads, seq_len, head_dim]
+        // Reconstruct as [1, seq_len, num_kv_heads, head_dim] then transpose
+        // back to [1, num_kv_heads, seq_len, head_dim].
         let k_t = Tensor::from_vec(
             k_flat,
-            (1, self.num_kv_heads, num_tokens_per_head, head_dim),
+            (1, seq_len, self.num_kv_heads, head_dim),
             &Device::Cpu,
         )?
+        .transpose(1, 2)?
+        .contiguous()?
         .to_dtype(self.dtype)?
         .to_device(&self.device)?;
         let v_t = Tensor::from_vec(
             v_flat,
-            (1, self.num_kv_heads, num_tokens_per_head, head_dim),
+            (1, seq_len, self.num_kv_heads, head_dim),
             &Device::Cpu,
         )?
+        .transpose(1, 2)?
+        .contiguous()?
         .to_dtype(self.dtype)?
         .to_device(&self.device)?;
 
@@ -520,7 +531,6 @@ impl TurboQuantKvCache {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.k_tokens.is_empty()
     }
