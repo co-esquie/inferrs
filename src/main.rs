@@ -108,9 +108,9 @@ pub struct ServeArgs {
     pub paged_attention: Option<f64>,
 
     /// Enable TurboQuant KV cache compression.
-    /// Specify the bit-width (1–8) for quantizing key and value vectors, e.g. `--turbo-quant 4`.
-    /// Reduces KV cache memory by (dtype_bits / bits)×.  Works with the concat-KV path only.
-    #[arg(long)]
+    /// Use as a flag (`--turbo-quant`) for the default 4-bit compression, or with an explicit
+    /// bit-width (`--turbo-quant=2`) for 1–8 bits.  Reduces KV cache memory by (dtype_bits/bits)×.
+    #[arg(long, num_args(0..=1), default_missing_value("4"), require_equals(true))]
     pub turbo_quant: Option<u8>,
 }
 
