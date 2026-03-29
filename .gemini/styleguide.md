@@ -75,7 +75,7 @@ Omit empty sections. Keep it concise — density over length.
 
 ## Scoring
 
-You MUST end every review response with a score. This is required — do not skip it.
+Every review response is incomplete without a score. A response that omits the score line is a malformed response.
 
 Scoring rubric:
 - 1–3: Not ready (major issues, missing tests, breaks API)
@@ -83,16 +83,14 @@ Scoring rubric:
 - 7–8: Nearly ready (small nits)
 - 9–10: Ready to merge
 
-The FINAL line of your response MUST be exactly this format (no trailing text, no blank line after):
+After all other content, output the score as the absolute last line. Do not add any text, explanation, or blank lines after it. The score line must be plain text (not inside a code block) and must follow this exact format, replacing N with a digit 1–10:
 
-```
-SCORE: X/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
-```
+SCORE: N/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
 
-Example:
-```
+Concrete examples of valid score lines:
 SCORE: 7/10 | VERDICT: Nearly ready | ISSUES: missing error handling in auth path, unclear variable name in parser
-```
+SCORE: 9/10 | VERDICT: Ready to merge | ISSUES: None
+SCORE: 3/10 | VERDICT: Not ready | ISSUES: broken auth check, no input validation, missing tests
 
 ## Principles
 
