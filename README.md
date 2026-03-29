@@ -6,17 +6,15 @@ and exposes an OpenAI-compatible API.
 ## Why inferrs?
 
 Most LLM serving stacks force a trade-off between features and resource usage.
-**inferrs** targets the sweet spot for desktop and single-GPU users:
+**inferrs** targets both:
 
 | | inferrs | vLLM | llama.cpp |
 |---|---|---|---|
 | **Language** | Rust | Python/C++ | C/C++ |
-| **Continuous batching** | ✓ | ✓ | ✗ |
 | **Streaming (SSE)** | ✓ | ✓ | ✓ |
-| **Chunked prefill** | ✓ | ✓ | ✗ |
-| **KV cache management** | Per-context allocation/PagedAttention | PagedAttention | Per-context allocation |
+| **KV cache management** | Per-context alloc or PagedAttention | PagedAttention | Per-context alloc |
 | **Desktop friendly** | ✓ — lightweight | ✗ — claims most GPU memory | ✓ — lightweight |
-| **Binary footprint** | Single static binary | Python environment + deps | Single binary |
+| **Binary footprint** | Single binary | Python environment + deps | Single binary |
 
 ## Features
 
@@ -83,10 +81,4 @@ curl http://localhost:8080/v1/chat/completions \
                                ▼          ▼          ▼          ▼
                           Scheduler    Transformer  KV Cache  Sampler
 ```
-
-- **Server** — Axum HTTP server, parses requests, tokenizes input, streams
-  tokens back via SSE.
-- **Engine** — Owns the model and runs the inference loop on a dedicated thread.
-- **Scheduler** — Continuous batching with chunked prefill and preemption.
-- **KV Cache** — Block-based, grow-on-demand allocation with free-list reuse.
 
