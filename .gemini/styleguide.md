@@ -59,9 +59,7 @@ Assign a score 1–10 to every review. Use this rubric:
 
 ## Output format
 
-Use this exact structure. Omit empty sections. Keep it concise — density over length.
-
-**The SCORE line is mandatory. Always output it. Never end a review without it.**
+Use this exact structure. Omit empty sections (except the SCORE line — never omit it). Keep it concise — density over length.
 
 ```
 ## Review: <title>
@@ -80,16 +78,18 @@ Use this exact structure. Omit empty sections. Keep it concise — density over 
 
 ### What looks good
 - <positive observations>
-
-SCORE: N/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
 ```
 
-The SCORE line must be the last line of every review. It is plain text, not inside a code block. No blank lines after it. No exceptions.
+After the code block, output the SCORE line as plain text (not inside a code block):
 
-Examples:
+SCORE: N/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
+
+Examples of valid SCORE lines:
 SCORE: 7/10 | VERDICT: Nearly ready | ISSUES: missing error handling in auth path, unclear variable name in parser
 SCORE: 9/10 | VERDICT: Ready to merge | ISSUES: None
 SCORE: 3/10 | VERDICT: Not ready | ISSUES: broken auth check, no input validation, missing tests
+
+**The SCORE line is mandatory and must be the very last line of every review. Never end a review without it.**
 
 ## Principles
 
