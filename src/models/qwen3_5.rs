@@ -282,10 +282,10 @@ impl FullAttention {
 
         let kv_len = k.dim(2)?;
 
-        // GQA: repeat k/v heads to match q heads
+        // GQA: repeat k/v heads so each query head has a corresponding k/v head.
         let groups = self.num_heads / self.num_kv_heads;
-        let k = k.repeat(&[1, groups, 1, 1])?;
-        let v = v.repeat(&[1, groups, 1, 1])?;
+        let k = repeat_kv(k, groups)?;
+        let v = repeat_kv(v, groups)?;
 
         // Scaled dot-product attention — matmul requires contiguous on Metal
         let scale = (self.head_dim as f64).sqrt();
@@ -414,8 +414,8 @@ impl FullAttention {
 
         // ── GQA expand ───────────────────────────────────────────────────────
         let groups = self.num_heads / self.num_kv_heads;
-        let k_full = k_full.repeat(&[1, groups, 1, 1])?;
-        let v_full = v_full.repeat(&[1, groups, 1, 1])?;
+        let k_full = repeat_kv(k_full, groups)?;
+        let v_full = repeat_kv(v_full, groups)?;
 
         // ── Scaled dot-product attention ─────────────────────────────────────
         let scale = (self.head_dim as f64).sqrt();
@@ -443,6 +443,18 @@ impl FullAttention {
 
         self.o_proj.forward(&out).map_err(Into::into)
     }
+}
+
+/// Repeat KV heads for GQA: each kv_head is repeated `n_rep` times consecutively.
+fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
+    if n_rep == 1 {
+        return Ok(xs);
+    }
+    let (b, n_kv_heads, seq_len, head_dim) = xs.dims4()?;
+    let xs_cat = Tensor::cat(&vec![&xs; n_rep], 2)?;
+    xs_cat
+        .reshape((b, n_kv_heads * n_rep, seq_len, head_dim))
+        .map_err(Into::into)
 }
 
 /// Apply RmsNorm to last dimension of a 4D tensor [b, h, t, d].

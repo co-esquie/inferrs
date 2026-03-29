@@ -9,6 +9,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelArchitecture {
     Qwen2,
+    Qwen3,
     Qwen35,
     Gemma2,
     Gemma3,
@@ -78,6 +79,10 @@ pub struct RawConfig {
     // Gemma3-specific
     pub sliding_window_pattern: Option<usize>,
 
+    // Qwen3-specific (flat, not nested; kept for potential future use)
+    #[allow(dead_code)]
+    pub layer_types: Option<Vec<String>>,
+
     // Qwen3.5-specific (nested text_config)
     pub text_config: Option<TextConfig>,
 }
@@ -96,7 +101,10 @@ impl RawConfig {
                 if arch.contains("Qwen3_5") {
                     return Ok(ModelArchitecture::Qwen35);
                 }
-                if arch.contains("Qwen2") || arch.contains("Qwen3") {
+                if arch.contains("Qwen3") {
+                    return Ok(ModelArchitecture::Qwen3);
+                }
+                if arch.contains("Qwen2") {
                     return Ok(ModelArchitecture::Qwen2);
                 }
                 if arch.contains("Gemma3") {
@@ -110,7 +118,8 @@ impl RawConfig {
 
         if let Some(model_type) = &self.model_type {
             match model_type.as_str() {
-                "qwen2" | "qwen2_5" | "qwen3" => return Ok(ModelArchitecture::Qwen2),
+                "qwen2" | "qwen2_5" => return Ok(ModelArchitecture::Qwen2),
+                "qwen3" => return Ok(ModelArchitecture::Qwen3),
                 "qwen3_5" => return Ok(ModelArchitecture::Qwen35),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
                 "gemma2" => return Ok(ModelArchitecture::Gemma2),
@@ -196,6 +205,44 @@ impl RawConfig {
             sliding_window: self.sliding_window.unwrap_or(1024),
             sliding_window_pattern: self.sliding_window_pattern.unwrap_or(6),
             max_position_embeddings: self.max_position_embeddings.unwrap_or(131072),
+        }
+    }
+
+    /// Build a Qwen3Config (all-full-attention transformer with gated q_proj).
+    /// Qwen3 is the same architecture as the full-attention layers in Qwen3.5
+    /// but all layers are full-attention and weights live under `model.*` (not
+    /// `model.language_model.*`).
+    pub fn to_qwen3_config(
+        &self,
+        dtype: DType,
+        device: Device,
+    ) -> crate::models::qwen3::Qwen3Config {
+        use crate::models::qwen3::Qwen3Config;
+
+        let vocab_size = self.vocab_size.unwrap_or(151936);
+        let hidden_size = self.hidden_size.unwrap_or(1024);
+        let intermediate_size = self.intermediate_size.unwrap_or(3072);
+        let num_hidden_layers = self.num_hidden_layers.unwrap_or(28);
+        let num_attention_heads = self.num_attention_heads.unwrap_or(16);
+        let num_key_value_heads = self.num_key_value_heads.unwrap_or(8);
+        let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
+        let rms_norm_eps = self.rms_norm_eps.unwrap_or(1e-6);
+        let tie_word_embeddings = self.tie_word_embeddings.unwrap_or(true);
+        let rope_theta = self.rope_theta.unwrap_or(1_000_000.0);
+
+        Qwen3Config {
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            rms_norm_eps,
+            tie_word_embeddings,
+            rope_theta,
+            dtype,
+            device,
         }
     }
 
@@ -290,6 +337,7 @@ impl RawConfig {
             }
             ModelArchitecture::Gemma2 => self.max_position_embeddings.unwrap_or(8192),
             ModelArchitecture::Qwen2 => self.max_position_embeddings.unwrap_or(131072),
+            ModelArchitecture::Qwen3 => self.max_position_embeddings.unwrap_or(40960),
             ModelArchitecture::Qwen35 => {
                 let tc = self.text_config.as_ref();
                 // Qwen3.5 uses linear attention for most layers; the full-attn
@@ -307,6 +355,14 @@ impl RawConfig {
     /// layers are excluded).
     pub fn kv_cache_params(&self, arch: &ModelArchitecture) -> (usize, usize, usize) {
         match arch {
+            ModelArchitecture::Qwen3 => {
+                let num_kv_heads = self.num_key_value_heads.unwrap_or(8);
+                let num_attention_heads = self.num_attention_heads.unwrap_or(16);
+                let hidden_size = self.hidden_size.unwrap_or(1024);
+                let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
+                let num_layers = self.num_hidden_layers.unwrap_or(28);
+                (num_kv_heads, head_dim, num_layers)
+            }
             ModelArchitecture::Qwen35 => {
                 let tc = self.text_config.as_ref();
                 let num_kv_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(2);
@@ -393,6 +449,7 @@ mod tests {
             attn_logit_softcapping: None,
             query_pre_attn_scalar: None,
             sliding_window_pattern: None,
+            layer_types: None,
             text_config: None,
         }
     }
