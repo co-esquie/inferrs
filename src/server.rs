@@ -158,9 +158,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     tracing::info!("Detected architecture: {:?}", arch);
 
     // Load tokenizer
-    let tokenizer = Tokenizer::from_file(
+    let tokenizer = Tokenizer::from_file_with_arch(
         &model_files.tokenizer_path,
         model_files.tokenizer_config_path.as_deref(),
+        Some(&arch),
     )?;
     let tokenizer = Arc::new(tokenizer);
 
@@ -196,9 +197,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let mut engine = crate::engine::Engine::new(
         model,
         // The engine needs its own tokenizer for decoding
-        Tokenizer::from_file(
+        Tokenizer::from_file_with_arch(
             &model_files.tokenizer_path,
             model_files.tokenizer_config_path.as_deref(),
+            Some(&arch),
         )?,
         device.clone(),
         args.max_batch_size,

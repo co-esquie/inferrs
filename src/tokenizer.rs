@@ -98,13 +98,21 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn from_file(tokenizer_path: &Path, tokenizer_config_path: Option<&Path>) -> Result<Self> {
+        Self::from_file_with_arch(tokenizer_path, tokenizer_config_path, None)
+    }
+
+    pub fn from_file_with_arch(
+        tokenizer_path: &Path,
+        tokenizer_config_path: Option<&Path>,
+        arch_override: Option<&crate::config::ModelArchitecture>,
+    ) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
         let config = tokenizer_config_path.and_then(|p| TokenizerConfig::from_file(p).ok());
 
-        // Detect chat template
         let chat_template = detect_chat_template(&config);
+        let _ = arch_override; // reserved for future architecture-specific overrides
 
         let eos_token = config.as_ref().and_then(|c| c.eos_token_str());
 
@@ -118,7 +126,7 @@ impl Tokenizer {
         if let Some(id) = eos_token_id {
             stop_token_ids.push(id);
         }
-        for extra in &["<|endoftext|>", "<|im_end|>", "<end_of_turn>"] {
+        for extra in &["<|endoftext|>", "<|im_end|>", "<end_of_turn>", "<turn|>"] {
             if let Some(id) = inner.token_to_id(extra) {
                 if !stop_token_ids.contains(&id) {
                     stop_token_ids.push(id);

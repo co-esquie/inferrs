@@ -140,9 +140,10 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     let max_seq_len = raw_config.effective_max_seq_len(&arch);
 
     // Load tokenizer (used by the REPL to build prompts)
-    let tokenizer = Tokenizer::from_file(
+    let tokenizer = Tokenizer::from_file_with_arch(
         &model_files.tokenizer_path,
         model_files.tokenizer_config_path.as_deref(),
+        Some(&arch),
     )?;
 
     // Load model weights
@@ -156,9 +157,10 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     )?;
 
     // Engine tokenizer (separate instance — engine runs on its own thread)
-    let engine_tokenizer = Tokenizer::from_file(
+    let engine_tokenizer = Tokenizer::from_file_with_arch(
         &model_files.tokenizer_path,
         model_files.tokenizer_config_path.as_deref(),
+        Some(&arch),
     )?;
 
     // Spawn engine on a dedicated OS thread.

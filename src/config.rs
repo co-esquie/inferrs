@@ -22,7 +22,7 @@ pub struct RopeParameters {
     pub partial_rotary_factor: Option<f64>,
 }
 
-/// Qwen3.5 text_config nested object.
+/// Shared text_config nested object (used by Qwen3.5).
 #[derive(Debug, Deserialize)]
 pub struct TextConfig {
     pub vocab_size: Option<usize>,
@@ -83,7 +83,6 @@ pub struct RawConfig {
     #[allow(dead_code)]
     pub layer_types: Option<Vec<String>>,
 
-    // Qwen3.5-specific (nested text_config)
     pub text_config: Option<TextConfig>,
 }
 
