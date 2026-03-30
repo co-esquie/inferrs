@@ -12,7 +12,7 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 |---|---|---|---|
 | **Language** | Rust | Python/C++ | C/C++ |
 | **Streaming (SSE)** | ✓ | ✓ | ✓ |
-| **KV cache management** | Per-context alloc or PagedAttention | PagedAttention | Per-context alloc |
+| **KV cache management** | TurboQuant, Per-context alloc, PagedAttention | PagedAttention | Per-context alloc |
 | **Desktop friendly** | ✓ — lightweight | ✗ — claims most GPU memory | ✓ — lightweight |
 | **Binary footprint** | Single binary | Python environment + deps | Single binary |
 
