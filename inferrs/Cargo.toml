@@ -1,0 +1,61 @@
+[package]
+name = "inferrs"
+version = "0.1.0"
+edition = "2021"
+description = "A conservative-memory inference engine for LLMs"
+license = "Apache-2.0"
+
+[[bin]]
+name = "inferrs"
+path = "src/main.rs"
+
+# On macOS, always enable Metal — in debug, release, and test builds alike.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ML / Tensor
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+
+# Tokenizer
+tokenizers = { version = "0.21", features = [] }
+
+# HuggingFace model hub
+hf-hub = { version = "0.4", features = ["tokio"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+async-stream = "0.3"
+anyhow = { workspace = true }
+crossterm = "0.28"
+
+# Dynamic backend loading (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+
+[dev-dependencies]
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"

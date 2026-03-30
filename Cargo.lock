@@ -1614,6 +1614,7 @@ dependencies = [
  "crossterm",
  "futures",
  "hf-hub",
+ "libloading",
  "serde",
  "serde_json",
  "tokenizers",
@@ -1623,6 +1624,29 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "inferrs-backend-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+]
+
+[[package]]
+name = "inferrs-backend-rocm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+]
+
+[[package]]
+name = "inferrs-backend-vulkan"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -1,0 +1,14 @@
+[package]
+name = "inferrs-backend-cuda"
+version = "0.1.0"
+edition = "2021"
+description = "CUDA backend plugin for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_cuda"
+crate-type = ["cdylib"]
+
+[dependencies]
+candle-core = { workspace = true, features = ["cuda"] }
+anyhow = { workspace = true }

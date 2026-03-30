@@ -1,3 +1,4 @@
+mod backend;
 mod bench;
 mod config;
 mod engine;
@@ -127,21 +128,65 @@ impl ServeArgs {
                 let device = candle_core::Device::new_metal(0)?;
                 Ok(device)
             }
-            "auto" => {
-                // Try Metal first (macOS), then CUDA, then CPU
-                if let Ok(device) = candle_core::Device::new_metal(0) {
-                    tracing::info!("Using Metal device");
-                    return Ok(device);
-                }
-                if let Ok(device) = candle_core::Device::new_cuda(0) {
-                    tracing::info!("Using CUDA device");
-                    return Ok(device);
-                }
-                tracing::info!("Using CPU device");
-                Ok(candle_core::Device::Cpu)
-            }
+            "auto" => Self::auto_device(),
             other => anyhow::bail!("Unknown device: {other}"),
         }
+    }
+
+    fn auto_device() -> Result<candle_core::Device> {
+        // macOS: always prefer Metal (linked directly, no plugin needed).
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(device) = candle_core::Device::new_metal(0) {
+                tracing::info!("Using Metal device");
+                return Ok(device);
+            }
+        }
+
+        // Linux: probe backend plugins via dlopen in priority order.
+        // The main binary is compiled CPU-only; GPU support is loaded at
+        // runtime from sibling `.so` files (CUDA, ROCm, Vulkan).
+        #[cfg(target_os = "linux")]
+        {
+            use crate::backend::BackendKind;
+            match crate::backend::detect_backend() {
+                BackendKind::Cuda => {
+                    let device = candle_core::Device::new_cuda(0)?;
+                    tracing::info!("Using CUDA device (via plugin)");
+                    return Ok(device);
+                }
+                BackendKind::Rocm => {
+                    // ROCm uses the same HIP/CUDA device path in candle.
+                    let device = candle_core::Device::new_cuda(0)?;
+                    tracing::info!("Using ROCm device (via plugin)");
+                    return Ok(device);
+                }
+                BackendKind::Vulkan => {
+                    // Vulkan driver detected. candle 0.8 does not yet have a
+                    // Vulkan/wgpu Device variant, so we fall through to CPU.
+                    // Vulkan acceleration will be enabled automatically once
+                    // candle gains wgpu support and this plugin is updated.
+                    tracing::info!(
+                        "Vulkan driver detected but candle 0.8 has no Vulkan \
+                         Device yet — falling back to CPU. Recompile with a \
+                         candle version that supports wgpu to enable Vulkan."
+                    );
+                }
+                BackendKind::Cpu => {}
+            }
+        }
+
+        // Windows / fallback: try CUDA (if compiled with the feature), then CPU.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            if let Ok(device) = candle_core::Device::new_cuda(0) {
+                tracing::info!("Using CUDA device");
+                return Ok(device);
+            }
+        }
+
+        tracing::info!("Using CPU device");
+        Ok(candle_core::Device::Cpu)
     }
 
     pub fn resolve_dtype(&self) -> Result<candle_core::DType> {

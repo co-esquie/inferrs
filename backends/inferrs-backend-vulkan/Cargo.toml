@@ -1,0 +1,14 @@
+[package]
+name = "inferrs-backend-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan backend plugin for inferrs (probe-only; full acceleration pending candle wgpu support)"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_vulkan"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use libc for low-level dlopen to probe libvulkan without linking it.
+libc = "0.2"

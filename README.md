@@ -20,8 +20,8 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`,
   `/v1/models`, `/health`
-- **Hardware backends** — CPU, CUDA (NVIDIA), Metal (Apple Silicon)
-  decoder-only transformers (safetensors format)
+- **Hardware backends** — CPU, Metal (Apple Silicon), CUDA (NVIDIA), ROCm (AMD),
+  Vulkan
 
 ## Quick start
 
@@ -38,36 +38,10 @@ brew install inferrs
 cargo build
 ```
 
-Enable GPU acceleration with a feature flag:
-
-```bash
-# NVIDIA
-cargo build --release --features cuda
-
-# Apple Silicon
-cargo build --release --features metal
-```
-
 ### Run
 
 ```bash
-# Serve a model (downloads automatically from HuggingFace Hub)
-inferrs serve Qwen/Qwen3.5-0.8B
-
-# Specify dtype and port
-inferrs serve Qwen/Qwen3.5-0.8B --dtype f16 --port 8080
-```
-
-### Query
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen3.5-0.8B",
-    "messages": [{"role": "user", "content": "Tell me a joke"}],
-    "stream": true
-  }'
+inferrs run --turbo-quant Qwen/Qwen3-0.6B 
 ```
 
 ## Architecture

@@ -8,54 +8,170 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            rustflags: ""
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            rustflags: "-C target-feature=+fullfp16"
+  # ── macOS binary (Metal, linked directly) ─────────────────────────────────
+  build-macos:
+    name: Build (aarch64-apple-darwin)
+    runs-on: macos-15
     env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
-
+      RUSTFLAGS: "-C target-feature=+fullfp16"
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-aarch64-apple-darwin
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target aarch64-apple-darwin -p inferrs
 
       - name: Package
-        shell: bash
         run: |
-          TARBALL="inferrs-${{ matrix.target }}.tar.gz"
-          tar -czf "$TARBALL" -C "target/${{ matrix.target }}/release" inferrs
-          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          tar -czf inferrs-aarch64-apple-darwin.tar.gz \
+            -C target/aarch64-apple-darwin/release inferrs
 
       - uses: actions/upload-artifact@v4
         with:
-          name: inferrs-${{ matrix.target }}
-          path: inferrs-${{ matrix.target }}.tar.gz
+          name: inferrs-aarch64-apple-darwin
+          path: inferrs-aarch64-apple-darwin.tar.gz
 
+  # ── Linux x86_64: CPU-only binary + all backend plugins ───────────────────
+  build-linux-x86:
+    name: Build (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-linux
+
+      # ── Main binary (CPU-only, no GPU features) ──────────────────────────
+      - name: Build main binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p inferrs
+
+      # ── CUDA backend plugin ──────────────────────────────────────────────
+      # Install the CUDA toolkit headers/stubs (no GPU required to compile).
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cuda-toolkit-12-6
+
+      - name: Build CUDA backend plugin
+        env:
+          CUDA_PATH: /usr/local/cuda
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-cuda
+
+      # ── ROCm backend plugin ──────────────────────────────────────────────
+      - name: Install ROCm toolkit
+        run: |
+          wget -q https://repo.radeon.com/amdgpu-install/6.3.3/ubuntu/noble/amdgpu-install_6.3.60303-1_all.deb
+          sudo dpkg -i amdgpu-install_6.3.60303-1_all.deb || true
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            rocm-dev hip-dev
+
+      - name: Build ROCm backend plugin
+        env:
+          ROCM_PATH: /opt/rocm
+          HIP_PATH: /opt/rocm
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-rocm
+
+      # ── Vulkan backend plugin (no GPU toolchain needed) ──────────────────
+      - name: Build Vulkan backend plugin
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-vulkan
+
+      # ── Package everything into one tarball ──────────────────────────────
+      - name: Package
+        run: |
+          RELEASE_DIR="target/x86_64-unknown-linux-gnu/release"
+          STAGE="inferrs-linux-x86_64"
+          mkdir -p "$STAGE"
+
+          # Main binary
+          cp "$RELEASE_DIR/inferrs" "$STAGE/"
+
+          # Backend plugins (ship all three; the binary picks the right one at
+          # runtime via dlopen — missing plugins are silently skipped)
+          for lib in \
+            libinferrs_backend_cuda.so \
+            libinferrs_backend_rocm.so \
+            libinferrs_backend_vulkan.so; do
+            if [ -f "$RELEASE_DIR/$lib" ]; then
+              cp "$RELEASE_DIR/$lib" "$STAGE/"
+            fi
+          done
+
+          tar -czf inferrs-x86_64-unknown-linux-gnu.tar.gz "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferrs-x86_64-unknown-linux-gnu
+          path: inferrs-x86_64-unknown-linux-gnu.tar.gz
+
+  # ── Linux aarch64: CPU-only binary + Vulkan plugin (no CUDA/ROCm on arm64) ─
+  build-linux-arm64:
+    name: Build (aarch64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04-arm
+    env:
+      RUSTFLAGS: "-C target-feature=+fullfp16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-aarch64-linux
+
+      # ── Main binary (CPU-only) ───────────────────────────────────────────
+      - name: Build main binary
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p inferrs
+
+      # ── Vulkan backend plugin (arm64 systems can have Vulkan drivers) ────
+      - name: Build Vulkan backend plugin
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs-backend-vulkan
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package
+        run: |
+          RELEASE_DIR="target/aarch64-unknown-linux-gnu/release"
+          STAGE="inferrs-linux-aarch64"
+          mkdir -p "$STAGE"
+          cp "$RELEASE_DIR/inferrs" "$STAGE/"
+          [ -f "$RELEASE_DIR/libinferrs_backend_vulkan.so" ] && \
+            cp "$RELEASE_DIR/libinferrs_backend_vulkan.so" "$STAGE/"
+          tar -czf inferrs-aarch64-unknown-linux-gnu.tar.gz "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferrs-aarch64-unknown-linux-gnu
+          path: inferrs-aarch64-unknown-linux-gnu.tar.gz
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────
   release:
     name: Publish release
-    needs: build
+    needs: [build-macos, build-linux-x86, build-linux-arm64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -74,7 +190,6 @@ jobs:
           SHORT="${SHA::7}"
           TAG="latest"
 
-          # Delete existing latest tag/release if present
           gh release delete "$TAG" --yes 2>/dev/null || true
           git -c user.email="actions@github.com" -c user.name="GitHub Actions" \
             init && gh api repos/$GH_REPO/git/refs/tags/$TAG \
@@ -86,6 +201,7 @@ jobs:
             --prerelease \
             inferrs-*.tar.gz
 
+  # ── Homebrew formula ───────────────────────────────────────────────────────
   update-formula:
     name: Update Homebrew formula
     needs: release
@@ -133,6 +249,31 @@ jobs:
 
             def install
               bin.install "inferrs"
+
+              # Install GPU backend plugins alongside the binary.
+              # The inferrs binary probes these at runtime via dlopen — only the
+              # plugins that match the host hardware are actually used.
+              # Missing plugins are silently skipped (CPU fallback applies).
+              %w[
+                libinferrs_backend_cuda.so
+                libinferrs_backend_rocm.so
+                libinferrs_backend_vulkan.so
+              ].each do |lib|
+                (lib_path / "inferrs" / lib).install lib if File.exist?(lib)
+              end
+            end
+
+            def post_install
+              # Create a symlink so the binary can find sibling plugins in the
+              # same directory (the binary searches its own dir first).
+              # On Linux, also link into the standard search path.
+              return unless OS.linux?
+
+              plugin_dir = lib_path / "inferrs"
+              bin_dir    = bin.realpath
+              plugin_dir.children.select { |f| f.extname == ".so" }.each do |so|
+                (bin_dir / so.basename).make_symlink(so) unless (bin_dir / so.basename).exist?
+              end
             end
 
             test do
@@ -144,7 +285,6 @@ jobs:
           # Push to homebrew tap repo via API
           CONTENT=$(base64 -w0 inferrs.rb)
 
-          # Get current file SHA if it exists (needed for updates)
           FILE_SHA=$(curl -sf \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://api.github.com/repos/ericcurtin/homebrew-inferrs/contents/Formula/inferrs.rb" \

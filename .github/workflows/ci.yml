@@ -18,7 +18,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --check
+      # Format-check only the packages that don't require GPU toolchains.
+      - run: cargo fmt --check -p inferrs -p inferrs-backend-vulkan
 
   clippy:
     name: Clippy
@@ -29,7 +30,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
+      # Lint only packages that don't require GPU toolchains.
+      - run: cargo clippy -p inferrs -p inferrs-backend-vulkan -- -D warnings
 
   build:
     name: Build (${{ matrix.target }})
@@ -61,4 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo test
+      # Test only packages that don't require GPU toolchains.
+      # The CUDA and ROCm backend plugins are built in the release workflow
+      # where the appropriate toolchains are installed.
+      - run: cargo test -p inferrs -p inferrs-backend-vulkan

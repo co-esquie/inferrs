@@ -1,0 +1,16 @@
+[package]
+name = "inferrs-backend-rocm"
+version = "0.1.0"
+edition = "2021"
+description = "ROCm backend plugin for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_rocm"
+crate-type = ["cdylib"]
+
+[dependencies]
+# candle's cuda feature covers ROCm/HIP via the same Device::new_cuda() path
+# when compiled with ROCm toolchain (hipcc / ROCM_PATH set at build time).
+candle-core = { workspace = true, features = ["cuda"] }
+anyhow = { workspace = true }
