@@ -66,7 +66,7 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let rot_dim = rot_half * 2;
 
     if rot_dim > d {
-        anyhow::bail!("rot_dim {} > head_dim {}", rot_dim, d);
+        anyhow::bail!("rot_dim {rot_dim} > head_dim {d}");
     }
 
     // Split x into rotated and pass-through parts
@@ -796,7 +796,7 @@ impl Qwen35Model {
         for (i, layer_type) in cfg.layer_types.iter().enumerate() {
             let layer_vb = lm_vb.pp("layers").pp(i.to_string());
             let layer = DecoderLayer::new(cfg, layer_vb, layer_type.is_full_attention)
-                .with_context(|| format!("loading layer {}", i))?;
+                .with_context(|| format!("loading layer {i}"))?;
             layers.push(layer);
         }
 

@@ -226,7 +226,7 @@ impl Engine {
                         Ok(r) => r,
                         Err(e) => GenerationResult {
                             output_token_ids: vec![],
-                            output_text: format!("Error: {}", e),
+                            output_text: format!("Error: {e}"),
                             finish_reason: "error".to_string(),
                             prompt_tokens: prompt_tokens.len(),
                             completion_tokens: 0,
@@ -247,7 +247,7 @@ impl Engine {
                     ) {
                         let _ = token_tx.blocking_send(StreamToken {
                             token_id: 0,
-                            text: format!("Error: {}", e),
+                            text: format!("Error: {e}"),
                             finish_reason: Some("error".to_string()),
                         });
                     }
@@ -279,7 +279,7 @@ impl Engine {
                     ) {
                         let _ = token_tx.send(StreamToken {
                             token_id: 0,
-                            text: format!("Error: {}", e),
+                            text: format!("Error: {e}"),
                             finish_reason: Some("error".to_string()),
                         });
                     }
@@ -297,7 +297,7 @@ impl Engine {
     fn paged_alloc_range(ps: &mut PagedState, start_pos: usize, count: usize) -> Result<()> {
         for pos in start_pos..start_pos + count {
             if !ps.block_table.ensure_allocated(pos, &mut ps.block_pool) {
-                anyhow::bail!("paged attention: out of KV blocks at position {}", pos);
+                anyhow::bail!("paged attention: out of KV blocks at position {pos}");
             }
         }
         Ok(())
@@ -327,10 +327,7 @@ impl Engine {
             .block_table
             .ensure_allocated(seqlen_offset, &mut ps.block_pool)
         {
-            anyhow::bail!(
-                "paged attention: out of KV blocks at position {}",
-                seqlen_offset
-            );
+            anyhow::bail!("paged attention: out of KV blocks at position {seqlen_offset}");
         }
         let input_ids = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
         model.forward_paged(&input_ids, seqlen_offset, &ps.block_table, &mut ps.kv_store)

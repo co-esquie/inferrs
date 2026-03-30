@@ -71,7 +71,7 @@ fn dirs_home() -> PathBuf {
 
 /// Convert "Org/Name" → "models--Org--Name" (mirrors hf-hub's `Repo::folder_name`).
 fn model_folder_name(model_id: &str) -> String {
-    format!("models--{}", model_id).replace('/', "--")
+    format!("models--{model_id}").replace('/', "--")
 }
 
 /// Recursively sum the size of all files under `path`.

@@ -150,8 +150,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
         if is_warmup {
             println!(
-                "  [{}] prefill={:.1}ms  decode={:.1}ms  output_tokens={}",
-                label, prefill_ms, decode_ms, n_output
+                "  [{label}] prefill={prefill_ms:.1}ms  decode={decode_ms:.1}ms  output_tokens={n_output}",
             );
         } else {
             prefill_ms_samples.push(prefill_ms);
@@ -173,8 +172,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             };
 
             println!(
-                "  [{}] TTFT={:.1}ms  decode={:.1}tok/s  prefill={:.1}tok/s  output_tokens={}",
-                label, ttft_ms, decode_tps, prefill_tps, n_output
+                "  [{label}] TTFT={ttft_ms:.1}ms  decode={decode_tps:.1}tok/s  prefill={prefill_tps:.1}tok/s  output_tokens={n_output}",
             );
         }
     }
@@ -211,18 +209,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
         "── Results ({} runs) ──────────────────────────────────────────",
         args.runs
     );
-    println!("  Prompt tokens (avg)     : {:.0}", mean_prompt_toks);
-    println!("  Output tokens (avg)     : {:.0}", mean_output_toks);
-    println!("  Prefill throughput      : {:.1} tok/s", mean_prefill_tps);
-    println!("  Decode  throughput      : {:.1} tok/s", mean_decode_tps);
-    println!("  Time to first token     : {:.1} ms", mean_prefill_ms);
-    println!(
-        "  Per-token latency (avg) : {:.2} ms/tok",
-        mean_per_token_ms
-    );
-    println!("  End-to-end latency (avg): {:.1} ms", mean_e2e_ms);
-    println!("  End-to-end p50          : {:.1} ms", p50);
-    println!("  End-to-end p90          : {:.1} ms", p90);
+    println!("  Prompt tokens (avg)     : {mean_prompt_toks:.0}");
+    println!("  Output tokens (avg)     : {mean_output_toks:.0}");
+    println!("  Prefill throughput      : {mean_prefill_tps:.1} tok/s");
+    println!("  Decode  throughput      : {mean_decode_tps:.1} tok/s");
+    println!("  Time to first token     : {mean_prefill_ms:.1} ms");
+    println!("  Per-token latency (avg) : {mean_per_token_ms:.2} ms/tok");
+    println!("  End-to-end latency (avg): {mean_e2e_ms:.1} ms");
+    println!("  End-to-end p50          : {p50:.1} ms");
+    println!("  End-to-end p90          : {p90:.1} ms");
 
     Ok(())
 }

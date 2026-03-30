@@ -346,7 +346,7 @@ impl Qwen3Model {
         for i in 0..cfg.num_hidden_layers {
             let layer_vb = model_vb.pp("layers").pp(i.to_string());
             let layer = DecoderLayer::new(cfg, layer_vb, tq_cfg.as_ref())
-                .with_context(|| format!("loading layer {}", i))?;
+                .with_context(|| format!("loading layer {i}"))?;
             layers.push(layer);
         }
 

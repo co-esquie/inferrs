@@ -86,7 +86,7 @@ fn download_safetensors(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf
     for filename in &filenames {
         let path = repo
             .get(filename)
-            .with_context(|| format!("Failed to download {}", filename))?;
+            .with_context(|| format!("Failed to download {filename}"))?;
         tracing::info!("Downloaded {}", filename);
         paths.push(path);
     }

@@ -140,7 +140,7 @@ impl ServeArgs {
                 tracing::info!("Using CPU device");
                 Ok(candle_core::Device::Cpu)
             }
-            other => anyhow::bail!("Unknown device: {}", other),
+            other => anyhow::bail!("Unknown device: {other}"),
         }
     }
 
@@ -149,7 +149,7 @@ impl ServeArgs {
             "f32" => Ok(candle_core::DType::F32),
             "f16" => Ok(candle_core::DType::F16),
             "bf16" => Ok(candle_core::DType::BF16),
-            other => anyhow::bail!("Unknown dtype: {}", other),
+            other => anyhow::bail!("Unknown dtype: {other}"),
         }
     }
 }

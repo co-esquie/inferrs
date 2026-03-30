@@ -145,6 +145,18 @@ fn server_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>)
     )
 }
 
+fn tokenization_error(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message: format!("Failed to tokenize: {e}"),
+                r#type: "invalid_request_error".to_string(),
+            },
+        }),
+    )
+}
+
 fn prompt_too_long_error(
     prompt_len: usize,
     max_seq_len: usize,
@@ -309,17 +321,7 @@ async fn chat_completions(
         .apply_chat_template_and_encode(&req.messages)
     {
         Ok(tokens) => tokens,
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: format!("Failed to tokenize: {}", e),
-                        r#type: "invalid_request_error".to_string(),
-                    },
-                }),
-            ));
-        }
+        Err(e) => return Err(tokenization_error(e)),
     };
 
     tracing::info!(
@@ -541,17 +543,7 @@ async fn completions(
     // Tokenize the prompt directly
     let prompt_tokens = match state.tokenizer.encode(&req.prompt, true) {
         Ok(tokens) => tokens,
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: format!("Failed to tokenize: {}", e),
-                        r#type: "invalid_request_error".to_string(),
-                    },
-                }),
-            ));
-        }
+        Err(e) => return Err(tokenization_error(e)),
     };
 
     check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;

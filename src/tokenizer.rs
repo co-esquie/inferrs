@@ -107,7 +107,7 @@ impl Tokenizer {
         arch_override: Option<&crate::config::ModelArchitecture>,
     ) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
         let config = tokenizer_config_path.and_then(|p| TokenizerConfig::from_file(p).ok());
 
@@ -164,7 +164,7 @@ impl Tokenizer {
         let encoding = self
             .inner
             .encode(text, add_special_tokens)
-            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
 
@@ -173,7 +173,7 @@ impl Tokenizer {
         let text = self
             .inner
             .decode(ids, skip_special_tokens)
-            .map_err(|e| anyhow::anyhow!("Detokenization failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Detokenization failed: {e}"))?;
         Ok(text)
     }
 

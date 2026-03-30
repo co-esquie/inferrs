@@ -192,7 +192,7 @@ pub fn paged_write_gather_sdpa(
         .map(|pos| {
             ctx.block_table
                 .slot_for(pos)
-                .ok_or_else(|| anyhow::anyhow!("paged attention: no slot for position {}", pos))
+                .ok_or_else(|| anyhow::anyhow!("paged attention: no slot for position {pos}"))
         })
         .collect::<Result<Vec<_>>>()?;
 

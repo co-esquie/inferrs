@@ -244,7 +244,7 @@ fn repl(
             MultilineState::None => "> ",
             MultilineState::Prompt => ". ",
         };
-        print!("{}", prompt_str);
+        print!("{prompt_str}");
         io::stdout().flush()?;
 
         // Read a line using crossterm raw mode so we get per-key control
@@ -325,7 +325,7 @@ fn repl(
         let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&messages) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Tokenization error: {}", e);
+                eprintln!("Tokenization error: {e}");
                 messages.pop();
                 continue;
             }
@@ -336,7 +336,7 @@ fn repl(
             match stream_response_collect(&engine_tx, prompt_tokens, &sampling_params) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("Generation error: {}", e);
+                    eprintln!("Generation error: {e}");
                     messages.pop();
                     continue;
                 }
@@ -419,7 +419,7 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
             println!("  Start a message with \"\"\" to enter multi-line mode.");
             println!("  End with \"\"\" on its own line to send.");
         }
-        other => println!("Unknown command: {}", other),
+        other => println!("Unknown command: {other}"),
     }
 }
 
