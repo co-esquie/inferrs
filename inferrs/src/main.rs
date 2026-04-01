@@ -203,11 +203,11 @@ impl ServeArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // For `run` and `rm`, suppress info-level logging by default — the interactive REPL
+    // For `run`, `bench`, and `rm`, suppress info-level logging by default — the interactive REPL
     // writes to stdout and log lines would corrupt the prompt display.
     // Users can still get logs by setting RUST_LOG explicitly (e.g. RUST_LOG=debug).
     let default_log_level = match &cli.command {
-        Commands::Run(_) | Commands::Rm(_) => "error",
+        Commands::Run(_) | Commands::Bench(_) | Commands::Rm(_) => "error",
         _ => "info",
     };
     tracing_subscriber::fmt()
