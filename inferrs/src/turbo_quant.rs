@@ -34,50 +34,54 @@ use candle_core::{DType, Device, Tensor};
 // Nibble packing helpers
 // ---------------------------------------------------------------------------
 
-/// Pack a flat slice of u8 indices into bytes.
+/// Pack a flat slice of u8 indices into a dense bitstream.
 ///
-/// For bits ≤ 4: two indices per byte (high nibble | low nibble).
-/// For bits 5–8: one index per byte (pass-through).
+/// Each index occupies exactly `bits` bits, packed into bytes MSB-first.  This
+/// is correct for all widths 1–8:
+///
+/// - bits=4: two indices per byte (identical to the previous nibble layout)
+/// - bits=8: one index per byte (pass-through)
+/// - bits=5/6/7: fractional indices per byte, no wasted bits
+///
+/// The packed length is always `ceil(indices.len() * bits / 8)`.
 fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
-    if bits <= 4 {
-        let packed_len = indices.len().div_ceil(2);
-        let mut packed = Vec::with_capacity(packed_len);
-        let mut i = 0;
-        while i < indices.len() {
-            let hi = indices[i] & 0x0F;
-            let lo = if i + 1 < indices.len() {
-                indices[i + 1] & 0x0F
-            } else {
-                0
-            };
-            packed.push((hi << 4) | lo);
-            i += 2;
+    let bits = bits as usize;
+    let packed_len = (indices.len() * bits).div_ceil(8);
+    let mut packed = vec![0u8; packed_len];
+    let mut bit_pos = 0usize; // next bit to write (MSB-first within each byte)
+    for &idx in indices {
+        let idx = idx as usize;
+        for b in (0..bits).rev() {
+            let bit = ((idx >> b) & 1) as u8;
+            let byte = bit_pos / 8;
+            let shift = 7 - (bit_pos % 8);
+            packed[byte] |= bit << shift;
+            bit_pos += 1;
         }
-        packed
-    } else {
-        indices.to_vec()
     }
+    packed
 }
 
-/// Unpack bytes back to a flat slice of u8 indices.
+/// Unpack a dense bitstream back to a flat slice of u8 indices.
 ///
-/// `total_elements` is the expected number of indices (needed for odd-length
-/// sequences when bits ≤ 4).
+/// Inverse of `pack_indices`.  `total_elements` is the number of indices to
+/// recover (required when the total bit count is not a multiple of 8).
 fn unpack_indices(packed: &[u8], bits: u8, total_elements: usize) -> Vec<u8> {
-    if bits <= 4 {
-        let mut out = Vec::with_capacity(total_elements);
-        for &byte in packed {
-            if out.len() < total_elements {
-                out.push((byte >> 4) & 0x0F);
-            }
-            if out.len() < total_elements {
-                out.push(byte & 0x0F);
-            }
+    let bits = bits as usize;
+    let mut out = Vec::with_capacity(total_elements);
+    let mut bit_pos = 0usize;
+    for _ in 0..total_elements {
+        let mut idx = 0u8;
+        for b in (0..bits).rev() {
+            let byte = bit_pos / 8;
+            let shift = 7 - (bit_pos % 8);
+            let bit = (packed[byte] >> shift) & 1;
+            idx |= bit << b;
+            bit_pos += 1;
         }
-        out
-    } else {
-        packed[..total_elements].to_vec()
+        out.push(idx);
     }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -359,13 +363,8 @@ impl TurboQuantKvCache {
         // Dequantize only the delta (new) tokens.
         //
         // Packed storage layout per head: all seq_len tokens in order.
-        // For bits≤4, packed bytes per token = head_dim/2.
-        // For bits>4,  packed bytes per token = head_dim.
-        let bytes_per_token = if self.bits <= 4 {
-            self.head_dim / 2
-        } else {
-            self.head_dim
-        };
+        // Each token occupies ceil(head_dim * bits / 8) bytes in the bitstream.
+        let bytes_per_token = (self.head_dim * self.bits as usize).div_ceil(8);
         let scales_per_token = self.head_dim / GROUP_SIZE;
 
         // Build flat f32 buffers for all heads, then do a single device upload each.
@@ -656,10 +655,10 @@ mod tests {
     }
 
     #[test]
-    fn memory_layout_uses_nibble_packing() {
+    fn memory_layout_uses_bitstream_packing() {
         let head_dim = 64usize;
         let seq_len = 10usize;
-        for bits in [2u8, 4, 8] {
+        for bits in [2u8, 4, 5, 6, 7, 8] {
             let mut cache = make_cache(head_dim, bits);
             let device = cache.device.clone();
             for _ in 0..seq_len {
@@ -668,13 +667,14 @@ mod tests {
                 cache.append(&t, &t).unwrap();
             }
             let n_elems = seq_len * head_dim;
-            let expected = if bits <= 4 {
-                n_elems.div_ceil(2)
-            } else {
-                n_elems
-            };
+            // Every bit width gets a dense bitstream: ceil(n_elems * bits / 8) bytes.
+            let expected_packed = (n_elems * bits as usize).div_ceil(8);
             let n_groups = head_dim / GROUP_SIZE;
-            assert_eq!(cache.k_packed[0].len(), expected, "bits={bits}");
+            assert_eq!(
+                cache.k_packed[0].len(),
+                expected_packed,
+                "bits={bits}: expected {expected_packed} packed bytes"
+            );
             assert_eq!(
                 cache.k_scales[0].len(),
                 seq_len * n_groups,
