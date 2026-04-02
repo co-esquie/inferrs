@@ -61,6 +61,10 @@ pub struct Gemma4Config {
     /// Layer index from which the MLP uses `intermediate_size * 2`.
     /// Set to `num_hidden_layers` to disable.
     pub double_wide_mlp_start_layer: usize,
+    /// First layer index that shares K,V from a donor layer.
+    /// Equal to `num_hidden_layers - num_kv_shared_layers`.
+    /// Set to `num_hidden_layers` when there is no KV sharing.
+    pub first_kv_shared_idx: usize,
     /// When `Some(bits)`, KV cache vectors are quantized using TurboQuant at the given bit-width.
     pub turbo_quant_bits: Option<u8>,
     pub dtype: DType,
@@ -1401,15 +1405,7 @@ impl Gemma4Model {
         //   Non-shared (0-14): last sliding = 13, last full = 14
         //   Shared (15-34): sliding layers → donor=13, full layers → donor=14
         let kv_sharing_map = {
-            let first_shared = cfg
-                .num_hidden_layers
-                .saturating_sub(cfg.double_wide_mlp_start_layer); // num_kv_shared_layers
-                                                                  // Compute first_kv_shared_layer_idx = num_hidden_layers - num_kv_shared_layers
-            let num_kv_shared = first_shared; // actually this is from double_wide_mlp_start_layer
-                                              // Wait, let me recompute: double_wide_mlp_start_layer = num_layers - num_kv_shared_layers
-                                              // So num_kv_shared_layers = num_layers - double_wide_mlp_start_layer
-            let first_kv_shared_idx = cfg.double_wide_mlp_start_layer;
-            let _ = num_kv_shared; // suppress warning
+            let first_kv_shared_idx = cfg.first_kv_shared_idx;
 
             // For each layer type, find the last non-shared layer index.
             let last_non_shared_sliding = (0..first_kv_shared_idx)

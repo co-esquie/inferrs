@@ -331,6 +331,10 @@ impl RawConfig {
         } else {
             num_hidden_layers // disabled: never trigger
         };
+        // KV sharing is independent of double-wide MLP (e.g. E4B has KV sharing
+        // but use_double_wide_mlp=false, so double_wide_mlp_start_layer would be
+        // num_hidden_layers and accidentally disable KV sharing).
+        let first_kv_shared_idx = num_hidden_layers.saturating_sub(num_kv_shared_layers);
 
         Gemma4Config {
             vocab_size,
@@ -357,6 +361,7 @@ impl RawConfig {
             tie_word_embeddings,
             layer_is_full_attention,
             double_wide_mlp_start_layer,
+            first_kv_shared_idx,
             turbo_quant_bits,
             dtype,
             device,
