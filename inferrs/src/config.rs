@@ -61,6 +61,8 @@ pub struct TextConfig {
     pub model_type: Option<String>,
     pub num_kv_shared_layers: Option<usize>,
     pub use_double_wide_mlp: Option<bool>,
+    pub num_global_key_value_heads: Option<usize>,
+    pub attention_k_eq_v: Option<bool>,
 }
 
 /// Raw config.json from HuggingFace.
@@ -287,6 +289,9 @@ impl RawConfig {
         let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(35);
         let num_attention_heads = tc.and_then(|t| t.num_attention_heads).unwrap_or(8);
         let num_key_value_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(1);
+        let num_global_key_value_heads = tc
+            .and_then(|t| t.num_global_key_value_heads)
+            .unwrap_or(num_key_value_heads);
         let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
         let global_head_dim = tc.and_then(|t| t.global_head_dim).unwrap_or(512);
         let hidden_size_per_layer_input = tc
@@ -300,6 +305,7 @@ impl RawConfig {
         let attn_logit_softcapping = tc.and_then(|t| t.attn_logit_softcapping);
         let query_pre_attn_scalar = tc.and_then(|t| t.query_pre_attn_scalar).unwrap_or(256);
         let attention_bias = tc.and_then(|t| t.attention_bias).unwrap_or(false);
+        let attention_k_eq_v = tc.and_then(|t| t.attention_k_eq_v).unwrap_or(false);
         let hidden_activation = parse_gemma_activation(
             tc.and_then(|t| t.hidden_activation.as_deref())
                 .unwrap_or("gelu_pytorch_tanh"),
@@ -343,6 +349,7 @@ impl RawConfig {
             num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
+            num_global_key_value_heads,
             head_dim,
             global_head_dim,
             hidden_size_per_layer_input,
@@ -357,6 +364,7 @@ impl RawConfig {
             attn_logit_softcapping,
             query_pre_attn_scalar,
             attention_bias,
+            attention_k_eq_v,
             hidden_activation,
             tie_word_embeddings,
             layer_is_full_attention,
@@ -541,7 +549,10 @@ impl RawConfig {
             }
             ModelArchitecture::Gemma4 => {
                 let tc = self.text_config.as_ref();
-                let num_kv_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(1);
+                let num_kv_heads_sliding = tc.and_then(|t| t.num_key_value_heads).unwrap_or(1);
+                let num_kv_heads = tc
+                    .and_then(|t| t.num_global_key_value_heads)
+                    .unwrap_or(num_kv_heads_sliding);
                 let head_dim = tc.and_then(|t| t.global_head_dim).unwrap_or(512);
                 let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(35);
                 let sliding_window_pattern = tc.and_then(|t| t.sliding_window_pattern).unwrap_or(5);

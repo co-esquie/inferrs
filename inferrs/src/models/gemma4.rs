@@ -36,6 +36,9 @@ pub struct Gemma4Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    /// KV heads for global (full) attention layers.
+    /// Defaults to `num_key_value_heads` when absent from config.
+    pub num_global_key_value_heads: usize,
     /// Head dimension for sliding-window attention layers.
     pub head_dim: usize,
     /// Head dimension for global (full) attention layers.
@@ -54,6 +57,8 @@ pub struct Gemma4Config {
     pub attn_logit_softcapping: Option<f64>,
     pub query_pre_attn_scalar: usize,
     pub attention_bias: bool,
+    /// When true, global attention layers share V with K (no separate v_proj).
+    pub attention_k_eq_v: bool,
     pub hidden_activation: Activation,
     pub tie_word_embeddings: bool,
     /// `true` for each layer that uses global (full) attention.
@@ -576,13 +581,23 @@ impl Attention {
     ) -> Result<Self> {
         let hs = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_heads = if is_sliding {
+            cfg.num_key_value_heads
+        } else {
+            cfg.num_global_key_value_heads
+        };
         let num_kv_groups = num_heads / num_kv_heads;
         let bias = cfg.attention_bias;
 
+        // Global layers in 31B-style models tie V to K (no separate v_proj weight).
+        let k_eq_v = !is_sliding && cfg.attention_k_eq_v;
         let q_proj = linear(hs, num_heads * head_dim, bias, vb.pp("q_proj"))?;
         let k_proj = linear(hs, num_kv_heads * head_dim, bias, vb.pp("k_proj"))?;
-        let v_proj = linear(hs, num_kv_heads * head_dim, bias, vb.pp("v_proj"))?;
+        let v_proj = if k_eq_v {
+            k_proj.clone()
+        } else {
+            linear(hs, num_kv_heads * head_dim, bias, vb.pp("v_proj"))?
+        };
         let o_proj = linear(num_heads * head_dim, hs, bias, vb.pp("o_proj"))?;
         let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
@@ -1033,6 +1048,18 @@ fn gqa_attention_no_expand(
 // Decoder Layer
 // ---------------------------------------------------------------------------
 
+/// Per-layer input (PLI) fields — only present when `hidden_size_per_layer_input > 0`
+/// (the efficient E2B/E4B variants). The 31B standard model omits these entirely.
+#[derive(Debug, Clone)]
+struct LayerPli {
+    /// hidden_size -> hidden_size_per_layer_input
+    gate: Linear,
+    /// hidden_size_per_layer_input -> hidden_size
+    projection: Linear,
+    norm: RmsNorm,
+    act_fn: Activation,
+}
+
 #[derive(Debug, Clone)]
 struct DecoderLayer {
     self_attn: Attention,
@@ -1041,16 +1068,11 @@ struct DecoderLayer {
     pre_feedforward_layernorm: RmsNorm,
     post_feedforward_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    /// Per-layer input gate: hidden_size -> hidden_size_per_layer_input
-    per_layer_input_gate: Linear,
-    /// Per-layer projection: hidden_size_per_layer_input -> hidden_size
-    per_layer_projection: Linear,
-    post_per_layer_input_norm: RmsNorm,
-    /// Scalar weight (shape [1]) multiplying the per-layer contribution,
-    /// pre-cast to the model dtype so no runtime dtype conversion is needed.
+    /// Scalar weight (shape [1]) multiplying the hidden state after MLP+PLI.
+    /// Pre-cast to model dtype at construction time.
     layer_scalar: Tensor,
-    /// Activation used in per-layer gate (same as MLP, typically gelu).
-    act_fn: Activation,
+    /// PLI fields; `None` for models without per-layer input (e.g. 31B).
+    pli: Option<LayerPli>,
 }
 
 impl DecoderLayer {
@@ -1111,25 +1133,34 @@ impl DecoderLayer {
             vb.pp("post_attention_layernorm"),
         )?;
 
-        // per_layer_input_gate: hs -> pli_dim
-        let per_layer_input_gate = linear(
-            cfg.hidden_size,
-            cfg.hidden_size_per_layer_input,
-            false,
-            vb.pp("per_layer_input_gate"),
-        )?;
-        // per_layer_projection: pli_dim -> hs
-        let per_layer_projection = linear(
-            cfg.hidden_size_per_layer_input,
-            cfg.hidden_size,
-            false,
-            vb.pp("per_layer_projection"),
-        )?;
-        let post_per_layer_input_norm = rms_norm(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_per_layer_input_norm"),
-        )?;
+        let pli = if cfg.hidden_size_per_layer_input > 0 {
+            let gate = linear(
+                cfg.hidden_size,
+                cfg.hidden_size_per_layer_input,
+                false,
+                vb.pp("per_layer_input_gate"),
+            )?;
+            let projection = linear(
+                cfg.hidden_size_per_layer_input,
+                cfg.hidden_size,
+                false,
+                vb.pp("per_layer_projection"),
+            )?;
+            let norm = rms_norm(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_per_layer_input_norm"),
+            )?;
+            Some(LayerPli {
+                gate,
+                projection,
+                norm,
+                act_fn: cfg.hidden_activation,
+            })
+        } else {
+            None
+        };
+
         // Pre-cast layer_scalar to the model dtype so the forward pass never
         // needs a runtime to_dtype() conversion (called once per token per layer).
         let layer_scalar = vb.get(1, "layer_scalar")?.to_dtype(cfg.dtype)?;
@@ -1141,11 +1172,8 @@ impl DecoderLayer {
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
             post_attention_layernorm,
-            per_layer_input_gate,
-            per_layer_projection,
-            post_per_layer_input_norm,
             layer_scalar,
-            act_fn: cfg.hidden_activation,
+            pli,
         })
     }
 
@@ -1155,11 +1183,11 @@ impl DecoderLayer {
     /// K,V tensors (after the KV cache) are returned so that KV-sharing layers
     /// that derive from this donor can reuse them.
     ///
-    /// `per_layer_input`: [b, s, hidden_size_per_layer_input]
+    /// `per_layer_input`: [b, s, hidden_size_per_layer_input], or `None` for non-PLI models.
     fn forward_donor(
         &mut self,
         xs: &Tensor,
-        per_layer_input: &Tensor,
+        per_layer_input: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
@@ -1180,12 +1208,12 @@ impl DecoderLayer {
     /// Instead of computing new K,V, this layer uses the K,V tensors from its
     /// donor layer (already accumulated through the donor's KV cache).
     ///
-    /// `per_layer_input`: [b, s, hidden_size_per_layer_input]
+    /// `per_layer_input`: [b, s, hidden_size_per_layer_input], or `None` for non-PLI models.
     /// `shared_key`, `shared_value`: accumulated K,V from the donor layer.
     fn forward_shared(
         &mut self,
         xs: &Tensor,
-        per_layer_input: &Tensor,
+        per_layer_input: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         shared_key: &Tensor,
@@ -1206,8 +1234,19 @@ impl DecoderLayer {
         self.apply_mlp_and_pli(xs, per_layer_input)
     }
 
-    /// Applies the MLP sub-layer, the per-layer input residual, and layer_scalar.
-    fn apply_mlp_and_pli(&mut self, xs: Tensor, per_layer_input: &Tensor) -> Result<Tensor> {
+    /// Applies the MLP sub-layer, the optional PLI residual, and layer_scalar.
+    fn apply_mlp_and_pli(
+        &mut self,
+        xs: Tensor,
+        per_layer_input: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        debug_assert_eq!(
+            self.pli.is_some(),
+            per_layer_input.is_some(),
+            "PLI presence mismatch: layer has pli={}, but per_layer_input={}",
+            self.pli.is_some(),
+            per_layer_input.is_some()
+        );
         // Standard Gemma MLP sub-layer
         let residual = &xs;
         let mlp_out = self
@@ -1217,7 +1256,8 @@ impl DecoderLayer {
         let mlp_out = mlp_out.apply(&self.post_feedforward_layernorm)?;
         let xs = (residual + mlp_out)?;
 
-        // Per-layer input residual path (applied after the MLP).
+        // Per-layer input residual path — only for efficient variants (E2B/E4B).
+        // Absent on standard models (e.g. 31B) where hidden_size_per_layer_input == 0.
         //
         // Reference (Gemma4DecoderLayer.forward):
         //   residual = hidden_states
@@ -1229,12 +1269,16 @@ impl DecoderLayer {
         //   hidden_states = residual + hidden_states
         //   if layer_scalar is not None:
         //       hidden_states *= layer_scalar                 ← applied to WHOLE state
-        let residual = &xs;
-        let gate = xs.apply(&self.per_layer_input_gate)?.apply(&self.act_fn)?;
-        let pli_out = gate.broadcast_mul(per_layer_input)?;
-        let pli_out = pli_out.apply(&self.per_layer_projection)?;
-        let pli_out = self.post_per_layer_input_norm.forward(&pli_out)?;
-        let xs = (residual + pli_out)?;
+        let xs = if let (Some(pli), Some(pli_input)) = (&self.pli, per_layer_input) {
+            let residual = &xs;
+            let gate = xs.apply(&pli.gate)?.apply(&pli.act_fn)?;
+            let pli_out = gate.broadcast_mul(pli_input)?;
+            let pli_out = pli_out.apply(&pli.projection)?;
+            let pli_out = pli.norm.forward(&pli_out)?;
+            (residual + pli_out)?
+        } else {
+            xs
+        };
 
         // layer_scalar multiplies the entire hidden state (not just the contribution).
         // Already cast to model dtype at construction; no runtime conversion needed.
@@ -1250,15 +1294,23 @@ impl DecoderLayer {
 // Top-level Model
 // ---------------------------------------------------------------------------
 
-pub struct Gemma4Model {
-    embed_tokens: candle_nn::Embedding,
-    /// Scaled per-layer embeddings: [vocab_size, num_layers * pli_dim],
-    /// scaled by `sqrt(pli_dim)`.
+/// Top-level PLI tensors — only present when `hidden_size_per_layer_input > 0`.
+struct ModelPli {
+    /// [vocab_size, num_layers * pli_dim], scaled by `sqrt(pli_dim) / sqrt(2)`.
     embed_tokens_per_layer: candle_nn::Embedding,
-    /// Projects hidden_state -> [num_layers * pli_dim], scaled by `hidden_size^{-0.5}`.
+    /// hidden_size -> num_layers * pli_dim
     per_layer_model_projection: Linear,
     /// RMS norm applied per pli_dim slice.
-    per_layer_projection_norm: RmsNorm,
+    per_layer_projection_norm: candle_nn::RmsNorm,
+    /// Fused scale for embed_tokens_per_layer: `sqrt(pli_dim) / sqrt(2)`.
+    embed_combined_scale: f64,
+    pli_dim: usize,
+}
+
+pub struct Gemma4Model {
+    embed_tokens: candle_nn::Embedding,
+    /// PLI model-level tensors; `None` for standard models (e.g. 31B).
+    pli: Option<ModelPli>,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -1266,17 +1318,8 @@ pub struct Gemma4Model {
     device: Device,
     dtype: DType,
     hidden_size: usize,
-    hidden_size_per_layer_input: usize,
     num_hidden_layers: usize,
     sliding_window: usize,
-    /// Scale applied to per-layer token embedding: `sqrt(hidden_size_per_layer_input) / sqrt(2)`.
-    /// This fuses three scalar operations into one:
-    ///   1. `sqrt(pli_dim)` — the embed_tokens_per_layer scale
-    ///   2. `1/sqrt(2)` — the per_layer_input_scale applied before adding to pli_proj
-    ///
-    /// The per_layer_input_scale for pli_proj is instead folded into the norm weight at
-    /// construction time so that the forward pass needs no extra multiply kernel.
-    pli_embed_combined_scale: f64,
     /// KV-sharing map: `kv_sharing_map[i] = Some(donor_idx)` if layer `i` is a KV-sharing
     /// layer whose K,V come from layer `donor_idx`.  `None` means the layer computes its own K,V.
     kv_sharing_map: Vec<Option<usize>>,
@@ -1300,40 +1343,42 @@ impl Gemma4Model {
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_lm.pp("embed_tokens"))?;
 
         // embed_tokens_per_layer: vocab -> num_layers * pli_dim
-        let embed_tokens_per_layer = candle_nn::embedding(
-            cfg.vocab_size,
-            cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
-            vb_lm.pp("embed_tokens_per_layer"),
-        )?;
-
-        // per_layer_model_projection: hs -> num_layers * pli_dim
-        let per_layer_model_projection = linear(
-            cfg.hidden_size,
-            cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
-            false,
-            vb_lm.pp("per_layer_model_projection"),
-        )?;
-
-        // per_layer_projection_norm: applied to each pli_dim slice.
-        // Uses scale_shift=0 (weight is applied directly, no +1 offset) matching
-        // the reference: Gemma4RMSNorm(..., scale_shift=0.0).
-        //
-        // Pre-scale the norm weight by `per_layer_input_scale = 1/sqrt(2)` so that the
-        // forward pass can compute `normed_pli_proj + pli_embed` directly without an
-        // extra scalar-multiply kernel dispatch per forward call.
-        let per_layer_input_scale = 1.0_f64 / 2.0_f64.sqrt();
-        let per_layer_projection_norm = {
-            let raw_norm = rms_norm(
-                cfg.hidden_size_per_layer_input,
-                cfg.rms_norm_eps,
-                vb_lm.pp("per_layer_projection_norm"),
+        // PLI tensors — only for efficient variants (hidden_size_per_layer_input > 0).
+        let model_pli = if cfg.hidden_size_per_layer_input > 0 {
+            let pli_dim = cfg.hidden_size_per_layer_input;
+            let embed_tokens_per_layer = candle_nn::embedding(
+                cfg.vocab_size,
+                cfg.num_hidden_layers * pli_dim,
+                vb_lm.pp("embed_tokens_per_layer"),
             )?;
-            // Extract the weight tensor, multiply by per_layer_input_scale, and
-            // reconstruct the RmsNorm.  This is safe because RmsNorm is purely
-            // multiplicative: norm(x) * (w * s) == (norm(x) * w) * s.
-            let layer_norm = raw_norm.into_inner();
-            let scaled_weight = (layer_norm.weight() * per_layer_input_scale)?;
-            candle_nn::RmsNorm::new(scaled_weight, cfg.rms_norm_eps)
+            let per_layer_model_projection = linear(
+                cfg.hidden_size,
+                cfg.num_hidden_layers * pli_dim,
+                false,
+                vb_lm.pp("per_layer_model_projection"),
+            )?;
+            // Pre-scale the norm weight by `1/sqrt(2)` so the forward pass can compute
+            // `normed_pli_proj + pli_embed` without an extra scalar-multiply dispatch.
+            let per_layer_input_scale = 1.0_f64 / 2.0_f64.sqrt();
+            let per_layer_projection_norm = {
+                let raw_norm = rms_norm(
+                    pli_dim,
+                    cfg.rms_norm_eps,
+                    vb_lm.pp("per_layer_projection_norm"),
+                )?;
+                let layer_norm = raw_norm.into_inner();
+                let scaled_weight = (layer_norm.weight() * per_layer_input_scale)?;
+                candle_nn::RmsNorm::new(scaled_weight, cfg.rms_norm_eps)
+            };
+            Some(ModelPli {
+                embed_tokens_per_layer,
+                per_layer_model_projection,
+                per_layer_projection_norm,
+                embed_combined_scale: (pli_dim as f64).sqrt() / 2.0_f64.sqrt(),
+                pli_dim,
+            })
+        } else {
+            None
         };
 
         let dtype = vb.dtype();
@@ -1440,9 +1485,7 @@ impl Gemma4Model {
 
         Ok(Self {
             embed_tokens,
-            embed_tokens_per_layer,
-            per_layer_model_projection,
-            per_layer_projection_norm,
+            pli: model_pli,
             layers,
             norm,
             lm_head,
@@ -1450,11 +1493,8 @@ impl Gemma4Model {
             device: dev.clone(),
             dtype,
             hidden_size: cfg.hidden_size,
-            hidden_size_per_layer_input: cfg.hidden_size_per_layer_input,
             num_hidden_layers,
             sliding_window: cfg.sliding_window,
-            pli_embed_combined_scale: (cfg.hidden_size_per_layer_input as f64).sqrt()
-                / 2.0f64.sqrt(),
             kv_sharing_map,
             kv_donor_buf: vec![None; num_hidden_layers],
             is_sliding_per_layer,
@@ -1559,44 +1599,23 @@ impl Gemma4Model {
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
 
-        // Per-layer token embeddings: [b, s, num_layers * pli_dim]
-        // Apply the combined scale: sqrt(pli_dim) * (1/sqrt(2)) — fuses the two scalar
-        // multiplications (embed scale and final per_layer_input_scale) into one.
-        // This is safe because pli_embed is not passed through a norm (no scale cancellation).
-        let pli_embed = self.embed_tokens_per_layer.forward(input_ids)?;
-        let pli_embed = (pli_embed * self.pli_embed_combined_scale)?;
-
-        // Project initial hidden state -> per-layer contribution.
-        // Shape: [b, s, num_layers * pli_dim]
-        // Note: the reference implementation scales by hidden_size^{-0.5} before the norm,
-        // but since RmsNorm normalises by RMS (making the output independent of positive
-        // input scale), that multiplication has no effect and is omitted here.
-        let pli_proj = xs.apply(&self.per_layer_model_projection)?;
-
-        // Reshape projection to [b, s, num_layers, pli_dim] and apply norm to the
-        // projection BEFORE combining with the embedding (matching the reference impl
-        // which calls per_layer_projection_norm on pli_proj alone, then adds pli_embed).
-        let pli_proj = pli_proj.reshape((
-            b_size,
-            seq_len,
-            self.num_hidden_layers,
-            self.hidden_size_per_layer_input,
-        ))?;
-        let pli_proj = self.per_layer_projection_norm.forward(&pli_proj)?;
-
-        // Reshape embedding to [b, s, num_layers, pli_dim] to match
-        let pli_embed = pli_embed.reshape((
-            b_size,
-            seq_len,
-            self.num_hidden_layers,
-            self.hidden_size_per_layer_input,
-        ))?;
-
-        // Add the normed (and pre-scaled by 1/sqrt(2) via the norm weight) projection to the
-        // pre-scaled embedding.  The per_layer_input_scale (1/sqrt(2)) has been folded into
-        // the `per_layer_projection_norm` weight at construction time, so no separate
-        // multiply is needed here — saving one kernel dispatch per forward call.
-        let pli_all = (pli_proj + pli_embed)?;
+        // Per-layer inputs (PLI) — only for efficient variants.
+        let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &self.pli {
+            let pli_embed = model_pli.embed_tokens_per_layer.forward(input_ids)?;
+            let pli_embed = (pli_embed * model_pli.embed_combined_scale)?;
+            let pli_proj = xs.apply(&model_pli.per_layer_model_projection)?;
+            let pli_proj =
+                pli_proj.reshape((b_size, seq_len, self.num_hidden_layers, model_pli.pli_dim))?;
+            let pli_proj = model_pli.per_layer_projection_norm.forward(&pli_proj)?;
+            let pli_embed =
+                pli_embed.reshape((b_size, seq_len, self.num_hidden_layers, model_pli.pli_dim))?;
+            let pli_all = (pli_proj + pli_embed)?;
+            (0..self.num_hidden_layers)
+                .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
+                .collect::<candle_core::Result<_>>()?
+        } else {
+            vec![None; self.num_hidden_layers]
+        };
 
         // Build attention masks (per attention type)
         let sliding_mask = if seq_len <= 1 {
@@ -1609,12 +1628,6 @@ impl Gemma4Model {
         } else {
             Some(self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset, false)?)
         };
-
-        // Pre-split pli_all along the layer dimension into a Vec of [b, s, pli_dim] slices.
-        // This replaces 35 narrow+squeeze calls inside the loop with 35 cheap Tensor clones.
-        let pli_per_layer: Vec<Tensor> = (0..self.num_hidden_layers)
-            .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)))
-            .collect::<candle_core::Result<_>>()?;
 
         // Clear only the donor-layer slots (those that are non-shared and may have been
         // written on the previous forward call).  Shared layers never write to kv_donor_buf,
@@ -1635,8 +1648,12 @@ impl Gemma4Model {
             match self.kv_sharing_map[layer_idx] {
                 None => {
                     // Non-shared (donor candidate): run forward and capture K,V
-                    let (new_xs, k, v) =
-                        self.layers[layer_idx].forward_donor(&xs, pli, mask, seqlen_offset)?;
+                    let (new_xs, k, v) = self.layers[layer_idx].forward_donor(
+                        &xs,
+                        pli.as_ref(),
+                        mask,
+                        seqlen_offset,
+                    )?;
                     xs = new_xs;
                     // Store K,V for any later layers that share from this layer
                     self.kv_donor_buf[layer_idx] = Some((k, v));
@@ -1653,7 +1670,7 @@ impl Gemma4Model {
                         })?;
                     xs = self.layers[layer_idx].forward_shared(
                         &xs,
-                        pli,
+                        pli.as_ref(),
                         mask,
                         seqlen_offset,
                         shared_k,
