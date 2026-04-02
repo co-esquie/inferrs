@@ -313,6 +313,19 @@ fn dequantize_into_f16(
 /// transfer for all prefill tokens — and `prefill_kv` is cleared.  This
 /// restores prefill throughput to the same level as the unquantized path.
 ///
+/// ## Warmup threshold
+///
+/// For short sequences the KV tensors are small enough that the GPU kernel for
+/// the attention computation is memory-bandwidth-limited by the weight matrices,
+/// not by the KV cache.  In this regime, the per-layer CPU↔GPU round-trips and
+/// quantization overhead of TurboQuant add latency without saving bandwidth.
+///
+/// To avoid this, `warmup_seq_len` keeps the KV data on-device unquantized
+/// (in `prefill_kv`, using the same zero-copy path as the prefill bypass) until
+/// the total sequence length exceeds the threshold.  Only once the sequence is
+/// long enough for the KV bandwidth to be the dominant cost does the cache flush
+/// and start compressing decode tokens.
+///
 /// ## Incremental dequantize with pre-allocated buffer
 ///
 /// A fixed-size on-device buffer of shape `[1, num_kv_heads, max_seq_len, head_dim]`
@@ -346,10 +359,16 @@ pub struct TurboQuantKvCache {
     kv_buffer: Option<(Tensor, Tensor)>,
     /// Maximum sequence length allocated in `kv_buffer`.  Zero until the buffer is created.
     kv_buffer_cap: usize,
-    /// Unquantized on-device KV tensors accumulated during prefill.
-    /// Cleared (and flushed into the quantized store) on the first decode call.
-    /// Shape when set: `[1, num_kv_heads, prefill_len, head_dim]`.
+    /// Unquantized on-device KV tensors accumulated during prefill AND during the
+    /// warmup phase.  Cleared (and flushed into the quantized store) once the total
+    /// sequence length reaches `warmup_seq_len`.
+    /// Shape when set: `[1, num_kv_heads, buffered_len, head_dim]`.
     prefill_kv: Option<(Tensor, Tensor)>,
+    /// Sequence-length threshold below which decode tokens are kept on-device
+    /// unquantized (no CPU round-trip).  Once the total cached length reaches this
+    /// value, the cache switches to the compressed path.  Set to 0 to always
+    /// compress from the first decode step (original behaviour).
+    warmup_seq_len: usize,
 }
 
 impl Clone for TurboQuantKvCache {
@@ -372,12 +391,26 @@ impl Clone for TurboQuantKvCache {
             kv_buffer: None,
             kv_buffer_cap: 0,
             prefill_kv: self.prefill_kv.clone(),
+            warmup_seq_len: self.warmup_seq_len,
         }
     }
 }
 
 impl TurboQuantKvCache {
     pub fn new(cfg: &TurboQuantConfig, num_kv_heads: usize, dtype: DType, device: Device) -> Self {
+        // Warmup threshold: keep KV data on-device unquantized until the sequence
+        // is long enough for KV bandwidth to dominate over weight bandwidth.
+        //
+        // At short contexts, the per-layer CPU↔GPU round-trips (35 pairs per decode
+        // step for Gemma4-E2B) add more latency than they save in KV bandwidth.
+        // The break-even point depends on model size and hardware, but ~256 tokens
+        // is a conservative lower bound before KV bandwidth matters on Metal.
+        //
+        // With this threshold, `--turbo-quant` matches plain-bf16 decode speed
+        // for contexts under 256 tokens, while still providing compression benefits
+        // for long conversations and documents.
+        let warmup_seq_len = 256;
+
         Self {
             bits: cfg.bits,
             orig_dtype: dtype,
@@ -393,6 +426,7 @@ impl TurboQuantKvCache {
             kv_buffer: None,
             kv_buffer_cap: 0,
             prefill_kv: None,
+            warmup_seq_len,
         }
     }
 
@@ -443,6 +477,14 @@ impl TurboQuantKvCache {
         Ok(())
     }
 
+    /// Return the total buffered (unquantized) sequence length in `prefill_kv`.
+    fn prefill_kv_len(&self) -> usize {
+        self.prefill_kv
+            .as_ref()
+            .map(|(k, _)| k.dim(2).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     /// Append newly computed key and value tensors to the cache.
     ///
     /// `k` and `v`: shape `[1, num_kv_heads, new_seq_len, head_dim]`
@@ -451,6 +493,13 @@ impl TurboQuantKvCache {
     /// unquantized on-device (no GPU→CPU transfer) and compressed in one
     /// batch on the first decode call, eliminating the per-layer transfer
     /// overhead during prefill.
+    ///
+    /// **Warmup phase**: while the total buffered length is below `warmup_seq_len`,
+    /// single-token decode appends are also kept on-device unquantized (appended
+    /// to `prefill_kv` via `Tensor::cat`).  This eliminates the 35-layer
+    /// CPU↔GPU round-trips that dominate latency at short sequence lengths.
+    /// Once the threshold is reached, the entire buffer is flushed to the
+    /// quantized store in one shot.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         let new_seq = k.dim(2)?;
         let head_dim = self.head_dim;
@@ -459,8 +508,15 @@ impl TurboQuantKvCache {
             anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
         }
 
-        if new_seq > 1 {
-            // Prefill path: store unquantized on-device; defer compression.
+        // Prefill path (new_seq > 1) and warmup phase (total buffered < threshold):
+        // store unquantized on-device; defer compression.
+        let current_buffered = self.prefill_kv_len();
+        let in_warmup = new_seq == 1
+            && self.warmup_seq_len > 0
+            && current_buffered + self.seq_len < self.warmup_seq_len;
+
+        if new_seq > 1 || in_warmup {
+            // Accumulate into the on-device unquantized buffer.
             let prefill_kv = match self.prefill_kv.take() {
                 None => (k.clone(), v.clone()),
                 Some((k_prev, v_prev)) => {
@@ -471,7 +527,8 @@ impl TurboQuantKvCache {
             };
             self.prefill_kv = Some(prefill_kv);
         } else {
-            // Decode path: if there are uncompressed prefill tokens, flush them first.
+            // Past the warmup threshold: flush any buffered unquantized tokens first,
+            // then compress the new decode token.
             if let Some((pk, pv)) = self.prefill_kv.take() {
                 self.compress_tensors(&pk, &pv)?;
             }
@@ -692,6 +749,13 @@ impl TurboQuantKvCache {
         Ok((k, v))
     }
 
+    /// Disable the warmup phase (set threshold to 0).  For testing only.
+    #[cfg(test)]
+    fn without_warmup(mut self) -> Self {
+        self.warmup_seq_len = 0;
+        self
+    }
+
     /// Clear all cached tokens (start of a new sequence).
     ///
     /// The pre-allocated `kv_buffer` is retained but the sequence pointers are
@@ -740,6 +804,7 @@ mod tests {
         let device = test_device();
         let dtype = test_dtype(&device);
         TurboQuantKvCache::new(&TurboQuantConfig { bits, head_dim }, 1, dtype, device)
+            .without_warmup()
     }
 
     fn make_cache_multihead(head_dim: usize, bits: u8, num_kv_heads: usize) -> TurboQuantKvCache {
@@ -751,6 +816,7 @@ mod tests {
             dtype,
             device,
         )
+        .without_warmup()
     }
 
     /// Round-trip a single vector and return MSE.

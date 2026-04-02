@@ -41,6 +41,24 @@ pub fn sample_token(
     } else {
         logits
     };
+
+    // Greedy sampling fast-path: argmax works in the native dtype (bf16/f32).
+    // Skipping the full-vocab to_dtype(F32) conversion saves a GPU kernel over
+    // ~256K elements on every decode step — the single most expensive sampler op
+    // for the temperature=0 case used in benchmarks and chat.
+    //
+    // Only safe when no repetition penalty is active: a penalty can change which
+    // token has the highest logit (e.g. the raw-argmax winner may be demoted below
+    // a competitor after division by the penalty factor).
+    if params.temperature < SAMPLING_EPS
+        && (params.repetition_penalty == 1.0 || previous_tokens.is_empty())
+    {
+        let token_id = logits.argmax(0)?.to_scalar::<u32>()?;
+        return Ok(token_id);
+    }
+
+    // Stochastic sampling path: convert to f32 for numerical stability of
+    // temperature scaling, softmax, and top-k/p filtering.
     let logits = logits.to_dtype(DType::F32)?;
 
     // Apply repetition penalty
@@ -49,12 +67,6 @@ pub fn sample_token(
     } else {
         logits
     };
-
-    // Greedy sampling if temperature is very low
-    if params.temperature < SAMPLING_EPS {
-        let token_id = logits.argmax(0)?.to_scalar::<u32>()?;
-        return Ok(token_id);
-    }
 
     // Apply temperature
     let logits = (&logits / params.temperature)?;

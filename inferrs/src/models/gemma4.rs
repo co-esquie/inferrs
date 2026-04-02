@@ -423,25 +423,33 @@ impl RetainingRotatingKvCache {
 }
 
 /// A KV cache for a single K or V tensor that retains its pre-allocated Metal
-/// buffer across sequence resets.
+/// buffer across sequence resets and grows it lazily by doubling.
 ///
-/// `candle_nn::kv_cache::Cache::reset()` sets `all_data = None`, which drops the
-/// Metal buffer and forces a fresh `Tensor::zeros(…, max_seq_len, …)` allocation
-/// on the next decode step.  For the global (full-attention) layers in Gemma4,
-/// `max_seq_len = 131_072` and `head_dim = 512`, so each K or V buffer is
-/// 131072 × 512 × 2 bytes (bf16) ≈ 128 MiB.  With 7 global layers that is
-/// 14 × 128 MiB ≈ 1.75 GiB of Metal buffer allocations (+ zero-fills) issued
-/// on the very first decode step after every prefill.
+/// ## Original design — problem
 ///
-/// By retaining the buffer and only resetting the sequence-length counter, the
-/// expensive allocation+zero-fill path is paid at most once (on the first ever
-/// decode step), and every subsequent sequence reuses the existing Metal buffer.
+/// The previous implementation allocated `Tensor::zeros([b, n_kv, max_seq_len, d])`
+/// on the *first decode step ever*, where `max_seq_len = 131_072` and `head_dim = 512`
+/// for Gemma4 global layers.  That is 128 MiB per K or V buffer.  With 7 global
+/// attention layers (3 non-shared + 4 KV-sharing) the first request triggered up to
+/// **1.75 GiB** of Metal `newBuffer + zero-fill` commands before a single token was
+/// generated.
+///
+/// ## This design — solution
+///
+/// Between requests, `reset()` zeroes only the sequence-length counter; the Metal
+/// buffer is retained so the next request reuses the same allocation (as before).
+/// If the next request is longer than the current capacity, the buffer is grown
+/// then — only one copy is needed per doubling, so long conversations pay O(log N)
+/// grow operations total.
 #[derive(Debug, Clone)]
 struct RetainingKvCache {
     k_buf: Option<candle_core::Tensor>,
     v_buf: Option<candle_core::Tensor>,
     /// Number of valid tokens currently stored in the buffer.
     seq_len: usize,
+    /// Number of tokens the current buffer can hold (always a power of two ≥ 256).
+    buf_cap: usize,
+    /// Hard upper limit (from `max_position_embeddings`).
     max_seq_len: usize,
 }
 
@@ -451,6 +459,7 @@ impl RetainingKvCache {
             k_buf: None,
             v_buf: None,
             seq_len: 0,
+            buf_cap: 0,
             max_seq_len,
         }
     }
@@ -464,29 +473,9 @@ impl RetainingKvCache {
         v: &candle_core::Tensor,
     ) -> candle_core::Result<(candle_core::Tensor, candle_core::Tensor)> {
         let t = k.dim(2)?; // number of new tokens
+        let needed = self.seq_len + t;
 
-        // Lazily allocate the pre-sized buffer on the first call.
-        if self.k_buf.is_none() {
-            let mut shape = k.dims().to_vec();
-            shape[2] = self.max_seq_len;
-            self.k_buf = Some(candle_core::Tensor::zeros(
-                shape.as_slice(),
-                k.dtype(),
-                k.device(),
-            )?);
-            let mut shape = v.dims().to_vec();
-            shape[2] = self.max_seq_len;
-            self.v_buf = Some(candle_core::Tensor::zeros(
-                shape.as_slice(),
-                v.dtype(),
-                v.device(),
-            )?);
-        }
-
-        let kb = self.k_buf.as_mut().expect("k_buf initialised above");
-        let vb = self.v_buf.as_mut().expect("v_buf initialised above");
-
-        if self.seq_len + t > self.max_seq_len {
+        if needed > self.max_seq_len {
             candle_core::bail!(
                 "RetainingKvCache: above max-seq-len {}+{}>{}",
                 self.seq_len,
@@ -494,6 +483,37 @@ impl RetainingKvCache {
                 self.max_seq_len
             );
         }
+
+        // Grow the buffer if necessary (double until capacity ≥ needed).
+        // Starting from 0, the first allocation sizes to max(needed, 256) so a
+        // single short conversation never allocates more than 256 tokens' worth.
+        if needed > self.buf_cap {
+            let new_cap = needed.next_power_of_two().max(256).min(self.max_seq_len);
+
+            let mut k_shape = k.dims().to_vec();
+            k_shape[2] = new_cap;
+            let new_k_buf = candle_core::Tensor::zeros(k_shape.as_slice(), k.dtype(), k.device())?;
+            let mut v_shape = v.dims().to_vec();
+            v_shape[2] = new_cap;
+            let new_v_buf = candle_core::Tensor::zeros(v_shape.as_slice(), v.dtype(), v.device())?;
+
+            // Copy existing valid tokens into the new (larger) buffer.
+            if self.seq_len > 0 {
+                if let (Some(kb_old), Some(vb_old)) = (&self.k_buf, &self.v_buf) {
+                    let k_valid = kb_old.narrow(2, 0, self.seq_len)?;
+                    let v_valid = vb_old.narrow(2, 0, self.seq_len)?;
+                    new_k_buf.slice_set(&k_valid, 2, 0)?;
+                    new_v_buf.slice_set(&v_valid, 2, 0)?;
+                }
+            }
+
+            self.k_buf = Some(new_k_buf);
+            self.v_buf = Some(new_v_buf);
+            self.buf_cap = new_cap;
+        }
+
+        let kb = self.k_buf.as_mut().expect("k_buf allocated above");
+        let vb = self.v_buf.as_mut().expect("v_buf allocated above");
 
         kb.slice_set(k, 2, self.seq_len)?;
         vb.slice_set(v, 2, self.seq_len)?;
@@ -507,10 +527,11 @@ impl RetainingKvCache {
     /// Reset the sequence-length counter **without dropping the Metal buffer**.
     ///
     /// The next `append` call will overwrite from position 0, so stale data
-    /// beyond `seq_len` is never read.
+    /// beyond `seq_len` is never read.  The buffer capacity is retained for reuse.
     fn reset(&mut self) {
         self.seq_len = 0;
-        // Intentionally retain k_buf / v_buf so the Metal allocation is reused.
+        // Intentionally retain k_buf / v_buf and buf_cap so the Metal allocation
+        // is reused on the next sequence without reallocation.
     }
 }
 
@@ -1524,10 +1545,10 @@ impl Gemma4Model {
         let key = (tgt_len, kv_len, seqlen_offset, is_sliding);
 
         if let Some(cached) = self.mask_cache.get(&key) {
-            // Return existing mask, expanding batch dim if needed.
-            return cached
-                .expand((b_size, 1, tgt_len, kv_len))?
-                .to_dtype(self.dtype);
+            // Mask is already stored in model dtype — only expand batch dim.
+            // Eliminates the `to_dtype` kernel call on cache hits, which is paid
+            // on every repeated prefill of the same prompt length.
+            return cached.expand((b_size, 1, tgt_len, kv_len));
         }
 
         let window = if is_sliding {
@@ -1583,12 +1604,13 @@ impl Gemma4Model {
             }
         };
 
-        // Cache as [1, 1, tgt_len, kv_len] so the b_size expand is cheap.
-        let mask_1 = mask.unsqueeze(0)?.unsqueeze(0)?;
+        // Convert to model dtype once, then cache as [1, 1, tgt_len, kv_len].
+        // Storing in model dtype means cache hits only need a cheap `expand`,
+        // eliminating the `to_dtype` GPU kernel on every repeated prefill call.
+        let mask_model_dtype = mask.to_dtype(self.dtype)?;
+        let mask_1 = mask_model_dtype.unsqueeze(0)?.unsqueeze(0)?;
         self.mask_cache.insert(key, mask_1.clone());
-        mask_1
-            .expand((b_size, 1, tgt_len, kv_len))?
-            .to_dtype(self.dtype)
+        mask_1.expand((b_size, 1, tgt_len, kv_len))
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
@@ -1600,6 +1622,16 @@ impl Gemma4Model {
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
 
         // Per-layer inputs (PLI) — only for efficient variants.
+        //
+        // `pli_all` has shape [b, seq_len, num_hidden_layers, pli_dim].
+        // We slice it into per-layer [b, seq_len, pli_dim] tensors using a single
+        // `narrow + squeeze` per layer.  The contiguous `pli_all` tensor is computed
+        // once; each `narrow(2, i, 1)` is a zero-copy metadata-only view on Metal,
+        // and `squeeze(2)` removes the singleton dim.
+        //
+        // The previous code applied `pli_proj + pli_embed` then looped
+        // `narrow(...).squeeze(...)` 35 times — identical semantically.  Making the
+        // loop explicit here keeps the rest of the forward pass unchanged.
         let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &self.pli {
             let pli_embed = model_pli.embed_tokens_per_layer.forward(input_ids)?;
             let pli_embed = (pli_embed * model_pli.embed_combined_scale)?;
@@ -1609,7 +1641,7 @@ impl Gemma4Model {
             let pli_proj = model_pli.per_layer_projection_norm.forward(&pli_proj)?;
             let pli_embed =
                 pli_embed.reshape((b_size, seq_len, self.num_hidden_layers, model_pli.pli_dim))?;
-            let pli_all = (pli_proj + pli_embed)?;
+            let pli_all = (pli_proj + pli_embed)?.contiguous()?;
             (0..self.num_hidden_layers)
                 .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
                 .collect::<candle_core::Result<_>>()?
