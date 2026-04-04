@@ -11,7 +11,7 @@ jobs:
   # ── macOS binary (Metal, linked directly) ─────────────────────────────────
   build-macos:
     name: Build (aarch64-apple-darwin)
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       RUSTFLAGS: "-C target-feature=+fullfp16"
     steps:
