@@ -267,8 +267,8 @@ jobs:
             --method DELETE 2>/dev/null || true
 
           # Create both the mutable `latest` tag and an immutable versioned tag.
-          # The versioned tag is what winget manifests reference so their
-          # SHA256s stay valid after subsequent releases.
+          # The versioned tag is what Scoop/Homebrew manifests reference so
+          # their SHA256s stay valid after subsequent releases.
           gh release create "$TAG" \
             --target "$SHA" \
             --title "latest (${SHORT})" \
@@ -372,9 +372,9 @@ jobs:
             -d "$PAYLOAD" \
             "https://api.github.com/repos/ericcurtin/homebrew-inferrs/contents/Formula/inferrs.rb"
 
-  # ── winget manifest ────────────────────────────────────────────────────────
-  update-winget:
-    name: Update winget manifest
+  # ── Scoop bucket manifest ──────────────────────────────────────────────────
+  update-scoop:
+    name: Update Scoop bucket
     needs: release
     runs-on: ubuntu-24.04
     env:
@@ -385,7 +385,7 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Compute SHA256s and submit winget PR
+      - name: Compute SHA256s and push Scoop manifest
         env:
           GH_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -393,117 +393,49 @@ jobs:
           SHA_WIN_X86=$(sha256sum inferrs-x86_64-pc-windows-msvc.zip | awk '{print $1}')
           SHA_WIN_ARM=$(sha256sum inferrs-aarch64-pc-windows-msvc.zip | awk '{print $1}')
 
-          PUBLISHER="ericcurtin"
-          PACKAGE_ID="${PUBLISHER}.inferrs"
-          # Use the versioned tag so URLs are immutable and SHA256s stay valid
           BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 
-          mkdir -p manifests
-
-          # ── version manifest ──────────────────────────────────────────────
-          cat > manifests/${PACKAGE_ID}.yaml <<EOF
-          PackageIdentifier: ${PACKAGE_ID}
-          PackageVersion: ${VERSION}
-          DefaultLocale: en-US
-          ManifestType: version
-          ManifestVersion: 1.6.0
+          # ── Scoop manifest (JSON) ─────────────────────────────────────────
+          cat > inferrs.json <<EOF
+          {
+            "version": "${VERSION}",
+            "description": "A conservative-memory inference engine for LLMs",
+            "homepage": "https://github.com/${REPO}",
+            "license": "Apache-2.0",
+            "architecture": {
+              "64bit": {
+                "url": "${BASE}/inferrs-x86_64-pc-windows-msvc.zip",
+                "hash": "${SHA_WIN_X86}"
+              },
+              "arm64": {
+                "url": "${BASE}/inferrs-aarch64-pc-windows-msvc.zip",
+                "hash": "${SHA_WIN_ARM}"
+              }
+            },
+            "bin": "inferrs.exe",
+            "checkver": {
+              "github": "https://github.com/${REPO}"
+            }
+          }
           EOF
 
-          # ── locale manifest ───────────────────────────────────────────────
-          cat > manifests/${PACKAGE_ID}.locale.en-US.yaml <<EOF
-          PackageIdentifier: ${PACKAGE_ID}
-          PackageVersion: ${VERSION}
-          PackageLocale: en-US
-          Publisher: ${PUBLISHER}
-          PackageName: inferrs
-          License: Apache-2.0
-          ShortDescription: A conservative-memory inference engine for LLMs
-          PackageUrl: https://github.com/${REPO}
-          ManifestType: defaultLocale
-          ManifestVersion: 1.6.0
-          EOF
+          # ── push manifest to the scoop bucket repo ────────────────────────
+          CONTENT=$(base64 -w0 inferrs.json)
 
-          # ── installer manifest ────────────────────────────────────────────
-          # InstallerType: zip requires NestedInstallerType + NestedInstallerFiles
-          # so winget knows the executable path inside the archive.
-          cat > manifests/${PACKAGE_ID}.installer.yaml <<EOF
-          PackageIdentifier: ${PACKAGE_ID}
-          PackageVersion: ${VERSION}
-          InstallerType: zip
-          NestedInstallerType: portable
-          NestedInstallerFiles:
-            - RelativeFilePath: inferrs.exe
-              PortableCommandAlias: inferrs
-          Installers:
-            - Architecture: x64
-              InstallerUrl: ${BASE}/inferrs-x86_64-pc-windows-msvc.zip
-              InstallerSha256: ${SHA_WIN_X86}
-            - Architecture: arm64
-              InstallerUrl: ${BASE}/inferrs-aarch64-pc-windows-msvc.zip
-              InstallerSha256: ${SHA_WIN_ARM}
-          ManifestType: installer
-          ManifestVersion: 1.6.0
-          EOF
-
-          DEST_DIR="manifests/e/ericcurtin/inferrs/${VERSION}"
-          BRANCH="inferrs-${VERSION}"
-
-          # ── create branch on fork before pushing files ────────────────────
-          FORK_SHA=$(curl -sf \
+          FILE_SHA=$(curl -sf \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/ref/heads/master" \
-            | jq -r '.object.sha')
+            "https://api.github.com/repos/ericcurtin/scoop-inferrs/contents/bucket/inferrs.json" \
+            | jq -r '.sha // empty' || true)
 
-          # 201 = created, 422 = branch already exists — both are acceptable
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+          PAYLOAD=$(jq -n \
+            --arg message "Update inferrs to ${VERSION}" \
+            --arg content "$CONTENT" \
+            --arg sha "$FILE_SHA" \
+            'if $sha != "" then {message: $message, content: $content, sha: $sha}
+             else {message: $message, content: $content} end')
+
+          curl -sf -X PUT \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg ref "refs/heads/${BRANCH}" --arg sha "$FORK_SHA" \
-                 '{ref: $ref, sha: $sha}')" \
-            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/refs")
-          [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "422" ]] || \
-            { echo "Branch creation failed with HTTP ${HTTP_STATUS}"; exit 1; }
-
-          # ── push manifest files to the fork branch ────────────────────────
-          for FILE in \
-            "${PACKAGE_ID}.yaml" \
-            "${PACKAGE_ID}.locale.en-US.yaml" \
-            "${PACKAGE_ID}.installer.yaml"; do
-
-            CONTENT=$(base64 -w0 "manifests/${FILE}")
-
-            # Fetch existing file SHA in case the file already exists on the branch
-            FILE_SHA=$(curl -sf \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/contents/${DEST_DIR}/${FILE}?ref=${BRANCH}" \
-              | jq -r '.sha // empty' || true)
-
-            PAYLOAD=$(jq -n \
-              --arg message "Add inferrs ${VERSION}" \
-              --arg content "$CONTENT" \
-              --arg branch "$BRANCH" \
-              --arg sha "$FILE_SHA" \
-              'if $sha != "" then {message: $message, content: $content, branch: $branch, sha: $sha}
-               else {message: $message, content: $content, branch: $branch} end')
-
-            curl -sf -X PUT \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" \
-              "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/contents/${DEST_DIR}/${FILE}"
-          done
-
-          # ── open PR from fork branch → microsoft/winget-pkgs ─────────────
-          # 201 = created, 422 = PR already exists — both are acceptable
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg title "New package: ${PACKAGE_ID} version ${VERSION}" \
-              --arg body "Automated submission from https://github.com/${REPO}" \
-              --arg head "${PUBLISHER}:${BRANCH}" \
-              --arg base "master" \
-              '{title: $title, body: $body, head: $head, base: $base}')" \
-            "https://api.github.com/repos/microsoft/winget-pkgs/pulls")
-          [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "422" ]] || \
-            { echo "PR creation failed with HTTP ${HTTP_STATUS}"; exit 1; }
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/ericcurtin/scoop-inferrs/contents/bucket/inferrs.json"

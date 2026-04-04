@@ -37,7 +37,8 @@ brew install inferrs
 **Windows**
 
 ```powershell
-winget install ericcurtin.inferrs
+scoop bucket add inferrs https://github.com/ericcurtin/scoop-inferrs
+scoop install inferrs
 ```
 
 ### Run
