@@ -16,9 +16,9 @@ default-members = [
 resolver = "2"
 
 [workspace.dependencies]
-candle-core = "0.8"
-candle-nn = "0.8"
-candle-transformers = "0.8"
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
 anyhow = "1"
 
 [profile.release]

@@ -163,9 +163,17 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
         dev: &Device,
     ) -> candle_core::Result<Tensor> {
         let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
+        // Use `dev` (the VarBuilder's device) for loading the quantized tensor
+        // so that if the caller requests CPU placement (e.g. for the enormous
+        // embed_tokens_per_layer table) the data never touches GPU memory.
+        let load_dev = if matches!(dev, Device::Cpu) {
+            dev
+        } else {
+            &self.device
+        };
         let qt = self
             .content
-            .tensor(&mut *reader, name, &self.device)
+            .tensor(&mut *reader, name, load_dev)
             .map_err(|e| {
                 candle_core::Error::CannotFindTensor {
                     path: format!("{name}: {e}"),
@@ -183,6 +191,25 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
             );
         }
         Ok(tensor)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
+        let load_dev = if matches!(dev, Device::Cpu) {
+            dev
+        } else {
+            &self.device
+        };
+        let qt = self
+            .content
+            .tensor(&mut *reader, name, load_dev)
+            .map_err(|e| {
+                candle_core::Error::CannotFindTensor {
+                    path: format!("{name}: {e}"),
+                }
+                .bt()
+            })?;
+        qt.dequantize(dev)?.to_dtype(dtype)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {

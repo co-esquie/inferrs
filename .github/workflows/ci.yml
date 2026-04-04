@@ -8,6 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Tell cudarc/bindgen_cuda the CUDA version and compute capability without
+  # requiring nvcc or nvidia-smi. candle-core's cuda feature pulls in both
+  # crates; their build scripts probe for GPU tooling by default, which fails
+  # on CI runners that don't have a CUDA toolkit installed.
+  CUDARC_CUDA_VERSION: "12060"
+  CUDA_COMPUTE_CAP: "80"
 
 jobs:
   fmt:
@@ -30,7 +36,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Lint only packages that don't require GPU toolchains.
+      - name: Install nvcc (needed by candle-kernels build script)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
       - run: cargo clippy -p inferrs -p inferrs-backend-vulkan -- -D warnings
 
   build:
@@ -63,7 +75,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # Test only packages that don't require GPU toolchains.
-      # The CUDA and ROCm backend plugins are built in the release workflow
-      # where the appropriate toolchains are installed.
+      - name: Install CUDA toolkit (Linux only — needed to build and link candle-core cuda feature)
+        if: runner.os == 'Linux'
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then REPO_ARCH="x86_64"; else REPO_ARCH="sbsa"; fi
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-6
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          # The stubs ship libcuda.so but the dynamic linker needs libcuda.so.1.
+          # Create the versioned symlink and expose the stubs dir so the test
+          # binary resolves its libcuda dependency on GPU-less CI runners.
+          sudo ln -sfn /usr/local/cuda/lib64/stubs/libcuda.so \
+                       /usr/local/cuda/lib64/stubs/libcuda.so.1
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - run: cargo test -p inferrs -p inferrs-backend-vulkan

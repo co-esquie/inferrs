@@ -128,7 +128,7 @@ jobs:
           name: inferrs-x86_64-unknown-linux-gnu
           path: inferrs-x86_64-unknown-linux-gnu.tar.gz
 
-  # ── Linux aarch64: CPU-only binary + Vulkan plugin (no CUDA/ROCm on arm64) ─
+  # ── Linux aarch64: main binary + CUDA/Vulkan plugins ─────────────────────
   build-linux-arm64:
     name: Build (aarch64-unknown-linux-gnu)
     runs-on: ubuntu-24.04-arm
@@ -145,9 +145,23 @@ jobs:
         with:
           key: release-aarch64-linux
 
-      # ── Main binary (CPU-only) ───────────────────────────────────────────
-      - name: Build main binary
-        run: cargo build --release --target aarch64-unknown-linux-gnu -p inferrs
+      # ── CUDA toolkit (aarch64 supports CUDA on Jetson/Grace/etc.) ────────
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cuda-toolkit-12-6
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_COMPUTE_CAP=87" >> "$GITHUB_ENV"
+
+      # ── Main binary + CUDA backend plugin ────────────────────────────────
+      - name: Build main binary + CUDA backend plugin
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs -p inferrs-backend-cuda
 
       # ── Vulkan backend plugin (arm64 systems can have Vulkan drivers) ────
       - name: Build Vulkan backend plugin
@@ -162,8 +176,11 @@ jobs:
           STAGE="inferrs-linux-aarch64"
           mkdir -p "$STAGE"
           cp "$RELEASE_DIR/inferrs" "$STAGE/"
-          [ -f "$RELEASE_DIR/libinferrs_backend_vulkan.so" ] && \
-            cp "$RELEASE_DIR/libinferrs_backend_vulkan.so" "$STAGE/"
+          for lib in \
+            libinferrs_backend_cuda.so \
+            libinferrs_backend_vulkan.so; do
+            [ -f "$RELEASE_DIR/$lib" ] && cp "$RELEASE_DIR/$lib" "$STAGE/"
+          done
           tar -czf inferrs-aarch64-unknown-linux-gnu.tar.gz "$STAGE"
 
       - uses: actions/upload-artifact@v4

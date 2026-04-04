@@ -97,6 +97,7 @@ pub struct RawConfig {
     pub query_pre_attn_scalar: Option<usize>,
 
     // Gemma3-specific
+    pub rope_local_base_freq: Option<f64>,
     pub sliding_window_pattern: Option<usize>,
 
     // Qwen3-specific (flat, not nested; kept for potential future use)
@@ -224,7 +225,8 @@ impl RawConfig {
                     .unwrap_or("gelu_pytorch_tanh"),
             ),
             rms_norm_eps: self.rms_norm_eps.unwrap_or(RMS_NORM_EPS_DEFAULT),
-            rope_theta: self.rope_theta.unwrap_or(10000.0),
+            rope_theta: self.rope_theta.unwrap_or(1_000_000.0),
+            rope_local_base_freq: self.rope_local_base_freq.unwrap_or(10_000.0),
             attention_bias: self.attention_bias.unwrap_or(false),
             final_logit_softcapping: self.final_logit_softcapping,
             attn_logit_softcapping: self.attn_logit_softcapping,
@@ -607,6 +609,7 @@ mod tests {
             max_position_embeddings: None,
             rms_norm_eps: None,
             rope_theta: None,
+            rope_local_base_freq: None,
             tie_word_embeddings: None,
             hidden_act: None,
             sliding_window: None,

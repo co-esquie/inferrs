@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "candle-nn"
-version = "0.8.4"
+version = "0.9.2"
 build = false
 autolib = false
 autobins = false
@@ -30,6 +30,24 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/huggingface/candle"
 
+[features]
+accelerate = [
+    "dep:accelerate-src",
+    "candle/accelerate",
+]
+cuda = ["candle/cuda"]
+cudnn = ["candle/cudnn"]
+default = []
+metal = [
+    "candle/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
+mkl = [
+    "dep:intel-mkl-src",
+    "candle/mkl",
+]
+
 [lib]
 name = "candle_nn"
 path = "src/lib.rs"
@@ -45,6 +63,10 @@ path = "examples/cpu_benchmarks.rs"
 [[test]]
 name = "batch_norm"
 path = "tests/batch_norm.rs"
+
+[[test]]
+name = "cpu_flash_attn"
+path = "tests/cpu_flash_attn.rs"
 
 [[test]]
 name = "group_norm"
@@ -92,11 +114,11 @@ version = "0.3.2"
 optional = true
 
 [dependencies.candle]
-version = "0.8.4"
+version = "0.9.2"
 package = "candle-core"
 
 [dependencies.candle-metal-kernels]
-version = "0.8.4"
+version = "0.9.2"
 optional = true
 
 [dependencies.half]
@@ -112,26 +134,28 @@ version = "0.8.1"
 features = ["mkl-static-lp64-iomp"]
 optional = true
 
-[dependencies.metal]
-version = "0.27.0"
-features = ["mps"]
-optional = true
+[dependencies.libc]
+version = "0.2.147"
 
 [dependencies.num-traits]
 version = "0.2.15"
+
+[dependencies.objc2-metal]
+version = "0.3.1"
+optional = true
 
 [dependencies.rayon]
 version = "1.7.0"
 
 [dependencies.safetensors]
-version = "0.4.1"
+version = "0.7.0"
 
 [dependencies.serde]
 version = "1.0.171"
 features = ["derive"]
 
 [dependencies.thiserror]
-version = "1"
+version = "2"
 
 [dev-dependencies.anyhow]
 version = "1"
@@ -142,7 +166,7 @@ version = "4.2.4"
 features = ["derive"]
 
 [dev-dependencies.criterion]
-version = "0.5.1"
+version = "0.8"
 default-features = false
 
 [dev-dependencies.rand]
@@ -150,20 +174,3 @@ version = "0.9.0"
 
 [dev-dependencies.rand_distr]
 version = "0.5.1"
-
-[features]
-accelerate = [
-    "dep:accelerate-src",
-    "candle/accelerate",
-]
-cuda = ["candle/cuda"]
-default = []
-metal = [
-    "candle/metal",
-    "dep:candle-metal-kernels",
-    "dep:metal",
-]
-mkl = [
-    "dep:intel-mkl-src",
-    "candle/mkl",
-]
