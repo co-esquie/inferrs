@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := build
 
 # Packages that can be built/tested without GPU toolchains (CUDA, ROCm).
-NO_GPU_PKGS := -p inferrs -p inferrs-backend-vulkan
+NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
 
 .PHONY: build all fmt clippy test
 
