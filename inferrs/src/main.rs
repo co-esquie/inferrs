@@ -6,6 +6,7 @@ mod engine;
 mod hub;
 mod kv_cache;
 mod models;
+mod pull;
 mod quantize;
 mod rm;
 mod run;
@@ -65,6 +66,8 @@ enum Commands {
     Run(run::RunArgs),
     /// Benchmark inference throughput and latency
     Bench(bench::BenchArgs),
+    /// Download a model to the local cache without serving it
+    Pull(pull::PullArgs),
     /// Remove a cached model from local disk
     Rm(rm::RmArgs),
 }
@@ -264,7 +267,7 @@ async fn main() -> Result<()> {
     // Users can still get logs by setting RUST_LOG explicitly (e.g. RUST_LOG=debug).
     let default_log_level = match &cli.command {
         Commands::Run(_) | Commands::Bench(_) | Commands::Rm(_) => "error",
-        _ => "info",
+        _ => "info", // Pull and Serve both benefit from info-level progress log
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -283,6 +286,9 @@ async fn main() -> Result<()> {
         Commands::Bench(args) => {
             tracing::info!("Running benchmark for model: {}", args.serve.model);
             bench::run(args)?;
+        }
+        Commands::Pull(args) => {
+            pull::run(args)?;
         }
         Commands::Rm(args) => {
             rm::run(args)?;
