@@ -223,6 +223,7 @@ pub enum SyncEngineRequest {
     GenerateStream {
         request_id: String,
         prompt_tokens: Vec<u32>,
+        audio: Option<AudioEmbedContext>,
         sampling_params: SamplingParams,
         token_tx: std::sync::mpsc::SyncSender<StreamToken>,
     },
@@ -902,12 +903,14 @@ impl Engine {
                 SyncEngineRequest::GenerateStream {
                     request_id,
                     prompt_tokens,
+                    audio,
                     sampling_params,
                     token_tx,
                 } => {
                     if let Err(e) = self.generate_stream_sync(
                         &request_id,
                         &prompt_tokens,
+                        audio,
                         &sampling_params,
                         &token_tx,
                     ) {
@@ -1009,9 +1012,13 @@ impl Engine {
         &mut self,
         request_id: &str,
         prompt_tokens: &[u32],
+        audio: Option<AudioEmbedContext>,
         sampling_params: &SamplingParams,
         token_tx: &std::sync::mpsc::SyncSender<StreamToken>,
     ) -> Result<()> {
+        if let Some(audio_ctx) = audio {
+            Self::cb_prepare_audio(&mut self.model, &self.device, prompt_tokens, audio_ctx)?;
+        }
         self.generate_stream_inner(request_id, prompt_tokens, sampling_params, token_tx)
     }
 
