@@ -13,9 +13,9 @@ use crossterm::{
 use std::io::{self, Write};
 use std::sync::mpsc as stdmpsc;
 
-use crate::engine::{load_engine, StreamToken, SyncEngineRequest};
+use crate::engine::{load_engine, AudioEmbedContext, StreamToken, SyncEngineRequest};
 use crate::sampler::SamplingParams;
-use crate::tokenizer::{ChatMessage, Role, Tokenizer};
+use crate::tokenizer::{apply_gemma4_with_audio, AudioInput, ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
@@ -87,6 +87,10 @@ pub struct RunArgs {
     #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
           value_name = "FORMAT")]
     pub quantize: Option<String>,
+
+    /// Path to a WAV audio file to attach to the prompt (Gemma 4 audio models).
+    #[arg(long)]
+    pub audio: Option<std::path::PathBuf>,
 }
 
 impl RunArgs {
@@ -141,6 +145,10 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     // Load model, build engine, attach paged KV.
     let ctx = load_engine(&serve)?;
 
+    // Extract fields needed before ctx is partially moved.
+    let audio_token_id = ctx.raw_config.audio_token_id;
+    let max_seq_len = ctx.max_seq_len;
+
     // REPL needs its own tokenizer for chat-template encoding.
     let tokenizer = Tokenizer::from_file_with_arch(
         &ctx.model_files.tokenizer_path,
@@ -161,7 +169,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         top_k: args.top_k,
         max_tokens: args
             .max_tokens
-            .min(ctx.max_seq_len.saturating_sub(4096).max(256)),
+            .min(max_seq_len.saturating_sub(4096).max(256)),
         ..SamplingParams::default()
     };
 
@@ -170,18 +178,58 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     if let Some(sys) = &args.system {
         messages.push(ChatMessage {
             role: Role::System,
+            audio: None,
             content: sys.clone(),
         });
     }
 
     // Non-interactive: single prompt then exit
     if let Some(prompt) = args.prompt {
+        // Build audio context if --audio was given.
+        let audio_ctx = if let Some(audio_path) = &args.audio {
+            let token_id = audio_token_id.ok_or_else(|| {
+                anyhow::anyhow!("This model does not support audio (no audio_token_id in config)")
+            })?;
+            let raw_bytes = std::fs::read(audio_path)?;
+            let samples = crate::audio::decode_audio(&raw_bytes, "wav")?;
+            let (mel_data, n_mel_frames) = crate::audio::compute_log_mel(&samples)?;
+            let effective_mel =
+                n_mel_frames.min(crate::models::audio_encoder::AudioEncoder::MAX_MEL_FRAMES);
+            let after_pass1 = (effective_mel.saturating_sub(1)) / 2 + 1;
+            let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
+            let mel_tensor = candle_core::Tensor::from_vec(
+                mel_data,
+                (1, n_mel_frames, crate::audio::N_MEL),
+                &candle_core::Device::Cpu,
+            )?;
+            messages.push(ChatMessage {
+                role: Role::User,
+                audio: Some(AudioInput {
+                    data: String::new(),
+                    format: "wav".to_string(),
+                }),
+                content: prompt,
+            });
+            let prompt_str = apply_gemma4_with_audio(&messages, &[n_audio_tokens]);
+            let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
+            let ctx = AudioEmbedContext {
+                mel: mel_tensor,
+                audio_token_id: token_id,
+            };
+            stream_response_collect(&engine_tx, prompt_tokens, Some(ctx), &sampling_params)?;
+            println!();
+            return Ok(());
+        } else {
+            None
+        };
+
         messages.push(ChatMessage {
             role: Role::User,
+            audio: None,
             content: prompt,
         });
         let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
-        stream_response_collect(&engine_tx, prompt_tokens, &sampling_params)?;
+        stream_response_collect(&engine_tx, prompt_tokens, audio_ctx, &sampling_params)?;
         println!();
         return Ok(());
     }
@@ -288,6 +336,7 @@ fn repl(
         messages.push(ChatMessage {
             role: Role::User,
             content: user_content,
+            audio: None,
         });
 
         // Encode the full conversation with the chat template
@@ -302,7 +351,7 @@ fn repl(
 
         // Stream the response and collect the full text for history
         let assistant_text =
-            match stream_response_collect(&engine_tx, prompt_tokens, &sampling_params) {
+            match stream_response_collect(&engine_tx, prompt_tokens, None, &sampling_params) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Generation error: {e}");
@@ -316,6 +365,7 @@ fn repl(
         // Append assistant turn to history
         messages.push(ChatMessage {
             role: Role::Assistant,
+            audio: None,
             content: assistant_text,
         });
     }
@@ -350,6 +400,7 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
                         ChatMessage {
                             role: Role::System,
                             content: parts[2].to_string(),
+                            audio: None,
                         },
                     );
                     println!("System prompt set.");
@@ -398,6 +449,7 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
 fn stream_response_collect(
     engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
     prompt_tokens: Vec<u32>,
+    audio: Option<AudioEmbedContext>,
     sampling_params: &SamplingParams,
 ) -> Result<String> {
     let (token_tx, token_rx) = stdmpsc::sync_channel::<StreamToken>(256);
@@ -406,6 +458,7 @@ fn stream_response_collect(
     engine_tx.send(SyncEngineRequest::GenerateStream {
         request_id,
         prompt_tokens,
+        audio,
         sampling_params: sampling_params.clone(),
         token_tx,
     })?;
