@@ -76,7 +76,7 @@ struct BenchmarkArgs {
     llama_model: String,
 
     /// Seconds to wait for a server to become healthy.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 1800)]
     server_ready_timeout: u64,
 
     /// Override path to the inferrs binary.
@@ -134,6 +134,7 @@ fn main() -> Result<()> {
             args.warmup,
             args.runs,
             args.max_tokens,
+            &args.inferrs_model,
             &prompt,
         );
         let elapsed = t_bench.elapsed();
@@ -185,6 +186,7 @@ fn main() -> Result<()> {
             args.warmup,
             args.runs,
             args.max_tokens,
+            &args.inferrs_model,
             &prompt,
         );
         let elapsed = t_bench.elapsed();
@@ -226,6 +228,7 @@ fn main() -> Result<()> {
             args.warmup,
             args.runs,
             args.max_tokens,
+            &args.llama_model,
             &prompt,
         );
         let elapsed = t_bench.elapsed();
@@ -264,6 +267,7 @@ fn run_one_backend<F>(
     args: &BenchmarkArgs,
     label: &str,
     port: u16,
+    model: &str,
     prompt: &str,
     start_fn: F,
 ) -> Result<BenchSummary>
@@ -290,6 +294,7 @@ where
         args.warmup,
         args.runs,
         args.max_tokens,
+        model,
         prompt,
     );
     let elapsed = t_bench.elapsed();
@@ -329,6 +334,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "llama-server -hf ggml-org/gemma-4-31B-it-GGUF",
         p_ref,
+        "ggml-org/gemma-4-31B-it-GGUF",
         &prompt,
         || start_llama_server("ggml-org/gemma-4-31B-it-GGUF", p_ref),
     )?;
@@ -336,6 +342,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --quantize nvidia/Gemma-4-31B-IT-NVFP4",
         p_inf,
+        "nvidia/Gemma-4-31B-IT-NVFP4",
         &prompt,
         || {
             start_inferrs(
@@ -350,6 +357,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --turbo-quant=false --quantize nvidia/Gemma-4-31B-IT-NVFP4",
         p_tq,
+        "nvidia/Gemma-4-31B-IT-NVFP4",
         &prompt,
         || {
             start_inferrs(
@@ -367,6 +375,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "llama-server -hf ggml-org/gemma-4-31B-it-GGUF",
         p_ref,
+        "ggml-org/gemma-4-31B-it-GGUF",
         &prompt,
         || start_llama_server("ggml-org/gemma-4-31B-it-GGUF", p_ref),
     )?;
@@ -374,6 +383,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --quantize google/gemma-4-31B-it",
         p_inf,
+        "google/gemma-4-31B-it",
         &prompt,
         || {
             start_inferrs(
@@ -388,6 +398,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --turbo-quant=false --quantize google/gemma-4-31B-it",
         p_tq,
+        "google/gemma-4-31B-it",
         &prompt,
         || {
             start_inferrs(
@@ -405,6 +416,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "vllm serve google/gemma-4-31B-it",
         p_vllm,
+        "google/gemma-4-31B-it",
         &prompt,
         || start_vllm_server("google/gemma-4-31B-it", p_vllm),
     )?;
@@ -412,6 +424,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --paged-attention google/gemma-4-31B-it",
         p_inf,
+        "google/gemma-4-31B-it",
         &prompt,
         || {
             start_inferrs(
@@ -426,6 +439,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-31B-it",
         p_tq,
+        "google/gemma-4-31B-it",
         &prompt,
         || {
             start_inferrs(
@@ -443,6 +457,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "vllm serve nvidia/Gemma-4-31B-IT-NVFP4",
         p_vllm,
+        "nvidia/Gemma-4-31B-IT-NVFP4",
         &prompt,
         || start_vllm_server("nvidia/Gemma-4-31B-IT-NVFP4", p_vllm),
     )?;
@@ -450,6 +465,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --paged-attention nvidia/Gemma-4-31B-IT-NVFP4",
         p_inf,
+        "nvidia/Gemma-4-31B-IT-NVFP4",
         &prompt,
         || {
             start_inferrs(
@@ -464,6 +480,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --turbo-quant=false --paged-attention nvidia/Gemma-4-31B-IT-NVFP4",
         p_tq,
+        "nvidia/Gemma-4-31B-IT-NVFP4",
         &prompt,
         || {
             start_inferrs(
@@ -481,6 +498,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "vllm serve google/gemma-4-E2B-it",
         p_vllm,
+        "google/gemma-4-E2B-it",
         &prompt,
         || start_vllm_server("google/gemma-4-E2B-it", p_vllm),
     )?;
@@ -488,6 +506,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --paged-attention google/gemma-4-E2B-it",
         p_inf,
+        "google/gemma-4-E2B-it",
         &prompt,
         || {
             start_inferrs(
@@ -502,6 +521,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         args,
         "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-E2B-it",
         p_tq,
+        "google/gemma-4-E2B-it",
         &prompt,
         || {
             start_inferrs(
@@ -938,6 +958,7 @@ fn bench_http(
     warmup: usize,
     runs: usize,
     max_tokens: usize,
+    model: &str,
     prompt: &str,
 ) -> Result<BenchSummary> {
     let url = format!("http://{host}:{port}/v1/chat/completions");
@@ -945,7 +966,7 @@ fn bench_http(
     // Non-streaming probe to get the true prompt token count.
     let n_prompt = {
         let body = serde_json::json!({
-            "model": "benchmark",
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1,
             "temperature": 0.0,
@@ -979,7 +1000,7 @@ fn bench_http(
 
     for i in 0..total {
         let is_warmup = i < warmup;
-        let (ttft_ms, total_ms, n_gen, output_text) = do_stream(&url, prompt, max_tokens)?;
+        let (ttft_ms, total_ms, n_gen, output_text) = do_stream(&url, model, prompt, max_tokens)?;
 
         let decode_ms = (total_ms - ttft_ms).max(1e-6);
         let prefill_tps = if ttft_ms > 0.0 {
@@ -1030,9 +1051,14 @@ fn bench_http(
 }
 
 /// Stream one chat-completion request; returns (ttft_ms, total_ms, n_gen, output_text).
-fn do_stream(url: &str, prompt: &str, max_tokens: usize) -> Result<(f64, f64, usize, String)> {
+fn do_stream(
+    url: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<(f64, f64, usize, String)> {
     let body = serde_json::json!({
-        "model": "benchmark",
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
