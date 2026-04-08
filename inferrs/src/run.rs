@@ -60,11 +60,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub system: Option<String>,
 
-    /// Enable paged attention KV cache (vLLM-style block management).
-    /// Specify the fraction of GPU/CPU memory to reserve for KV blocks,
-    /// e.g. `--paged-attention 0.6` reserves 60% of available memory.
-    /// When unset (the default) the standard concat-based KV cache is used.
-    #[arg(long)]
+    /// Fraction of GPU/CPU memory to reserve for paged KV blocks (vLLM-style block management).
+    /// e.g. `--paged-attention=0.9` reserves 90% of available memory.
+    /// When used as a plain flag (`--paged-attention`) the default 0.9 (90%) is used.
+    /// Omit the flag entirely to disable paged attention.
+    #[arg(long, num_args(0..=1), default_missing_value("0.9"), require_equals(true),
+          value_name = "FRACTION")]
     pub paged_attention: Option<f64>,
 
     /// TurboQuant KV cache compression bit-width (Qwen3/Gemma4).
