@@ -771,7 +771,7 @@ fn start_vllm_server(model: &str, port: u16) -> Result<Child> {
     // PeakMemoryTracker will therefore report near-zero memory for vllm groups;
     // the benchmark output notes this explicitly.
     let hf_hub_cache = hf_hub_cache_dir();
-    let volume = format!("{hf_hub_cache}:/root/.cache/huggingface/hub:ro");
+    let volume = format!("{hf_hub_cache}:/root/.cache/huggingface/hub");
 
     let port_mapping = format!("{port}:8000");
     let child = Command::new("docker")
