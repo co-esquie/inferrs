@@ -64,7 +64,7 @@ struct BenchmarkArgs {
     llama_port: u16,
 
     /// Port for the `vllm serve` backend (DGX Spark benchmarks).
-    #[arg(long, default_value_t = 8888)]
+    #[arg(long, default_value_t = 8000)]
     vllm_port: u16,
 
     /// HuggingFace model ID for inferrs.
@@ -773,12 +773,13 @@ fn start_vllm_server(model: &str, port: u16) -> Result<Child> {
     let hf_hub_cache = hf_hub_cache_dir();
     let volume = format!("{hf_hub_cache}:/root/.cache/huggingface/hub:ro");
 
+    let port_mapping = format!("{port}:8000");
     let child = Command::new("docker")
         .arg("run")
         .arg("--rm")
-        .arg("--runtime=nvidia")
         .arg("--gpus=all")
-        .arg("--network=host")
+        .arg("-p")
+        .arg(&port_mapping)
         .arg("-v")
         .arg(&volume)
         .arg("-e")
@@ -786,12 +787,7 @@ fn start_vllm_server(model: &str, port: u16) -> Result<Child> {
         .arg("-e")
         .arg("HUGGING_FACE_HUB_TOKEN")
         .arg("vllm/vllm-openai:gemma4-cu130")
-        .arg("--model")
         .arg(model)
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
