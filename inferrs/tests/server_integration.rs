@@ -341,6 +341,49 @@ fn gemma4_e2b_long_context_no_crash() {
     }
 }
 
+/// Verifies that `google/gemma-4-E2B-it` with 4-bit TurboQuant compression
+/// returns a coherent response to a basic chat message.
+///
+/// This test exercises the 4-bit KV cache path end-to-end, ensuring that the
+/// nibble-packing/unpacking round-trip does not corrupt inference.
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration gemma4_e2b_turbo_quant_4bit_returns_intelligible_output -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires model download and significant compute; run with --ignored"]
+fn gemma4_e2b_turbo_quant_4bit_returns_intelligible_output() {
+    let model_id = "google/gemma-4-E2B-it";
+    let port = free_port();
+
+    let mut server = spawn_server_turbo(model_id, port, 4);
+
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(300));
+
+        let resp = chat_completion(port, "What is 2 + 2?");
+        assert!(
+            looks_intelligible(&resp),
+            "4-bit TurboQuant response is not intelligible.\nGot: {:?}",
+            resp
+        );
+        assert!(
+            resp.contains('4'),
+            "expected the answer '4' in TurboQuant response.\nGot: {:?}",
+            resp
+        );
+        eprintln!("4-bit TurboQuant response: {:?}", resp);
+    });
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
 /// Verifies that `google/gemma-4-E2B-it` with `--paged-attention` handles a
 /// long prompt (>512 tokens) and that a second request after the first
 /// completes successfully (exercises block reuse correctness).

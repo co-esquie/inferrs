@@ -996,6 +996,104 @@ mod tests {
     }
 
     #[test]
+    fn full_openclaw_agent_turn_gemma4_is_well_formed() {
+        // Simulate a realistic OpenClaw multi-tool-call agent conversation
+        // rendered with the Gemma4 template:
+        //   system prompt → user → assistant (tool call, null content) →
+        //   tool result → assistant (text reply) → user follow-up
+        //
+        // After normalization:
+        // - The empty assistant tool-call turn is dropped.
+        // - The tool result (folded to "user") and the final user message are
+        //   consecutive user turns → merged into one.
+        // - Two user turns remain: the original question, and the merged
+        //   (tool-result + follow-up) turn.
+        let json = r#"[
+            {"role":"system","content":"You are a helpful assistant."},
+            {"role":"user","content":"What is the weather in Paris?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"Partly cloudy, 18°C"},
+            {"role":"assistant","content":"The weather in Paris is partly cloudy at 18°C."},
+            {"role":"user","content":"Thanks!"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        let prompt = apply_gemma4(&messages);
+
+        // System turn must be present.
+        assert!(
+            prompt.contains("<|turn>system\nYou are a helpful assistant."),
+            "system turn missing from Gemma4 prompt"
+        );
+        // No empty model turn from the dropped tool-call message.
+        assert!(
+            !prompt.contains("<|turn>model\n<turn|>"),
+            "empty model turn must not appear"
+        );
+        // Two user turns: original question + merged (tool-result + thanks).
+        let user_turns: Vec<_> = prompt.match_indices("<|turn>user").collect();
+        assert_eq!(
+            user_turns.len(),
+            2,
+            "expected: question turn + merged (tool-result + Thanks!) turn; got {} user turns",
+            user_turns.len()
+        );
+        // Text assistant reply is present.
+        assert!(
+            prompt.contains("partly cloudy at 18°C"),
+            "assistant text reply missing"
+        );
+        // Tool result is present.
+        assert!(
+            prompt.contains("Partly cloudy, 18°C"),
+            "tool result missing"
+        );
+        // User follow-up is present.
+        assert!(prompt.contains("Thanks!"), "user follow-up missing");
+        // Prompt ends with the model turn opener.
+        assert!(
+            prompt.ends_with("<|turn>model\n"),
+            "prompt must end with model turn opener"
+        );
+    }
+
+    #[test]
+    fn gemma4_tool_injection_via_system_context() {
+        // Verify that when a system message is already present, tool context
+        // injected into it produces a well-formed Gemma4 prompt with exactly
+        // one system turn containing both the original system text and the tool
+        // summary.  This mirrors the server-level inject_tools_into_messages
+        // path for Gemma4 models.
+        let tool_summary =
+            "Available tools:\n- get_weather: Get current weather\n  parameters: city: string";
+
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: MessageContent::from_string(format!(
+                    "You are a helpful assistant.\n\n{tool_summary}"
+                )),
+                audio: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            user_msg("What is the weather in Paris?"),
+        ];
+        let prompt = apply_gemma4(&messages);
+
+        // Exactly one system turn.
+        let system_turns: Vec<_> = prompt.match_indices("<|turn>system").collect();
+        assert_eq!(system_turns.len(), 1, "expected exactly one system turn");
+        // Both the original text and the tool summary are present.
+        assert!(prompt.contains("You are a helpful assistant."));
+        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("get_weather"));
+        // Exactly one user turn.
+        let user_turns: Vec<_> = prompt.match_indices("<|turn>user").collect();
+        assert_eq!(user_turns.len(), 1, "expected exactly one user turn");
+        assert!(prompt.ends_with("<|turn>model\n"));
+    }
+
+    #[test]
     fn full_openclaw_agent_turn_chatml_is_well_formed() {
         // Simulate a realistic OpenClaw multi-tool-call agent conversation:
         //   system prompt → user → assistant (tool call, null content) →
