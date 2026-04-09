@@ -81,14 +81,37 @@ pub fn load_bundle(bundle_path: &Path) -> Result<ModelFiles> {
     };
 
     let format = mp_config.config.format.to_lowercase();
+
+    // Bind to local variables for readability.
+    let fmt_str = if format.is_empty() { "<auto>" } else { &format };
+    let arch_str = if mp_config.config.architecture.is_empty() {
+        "<unknown>"
+    } else {
+        &mp_config.config.architecture
+    };
+    let params_str = if mp_config.config.param_size.is_empty() {
+        "?"
+    } else {
+        &mp_config.config.param_size
+    };
+    let quant_str = if mp_config.config.quantization.is_empty() {
+        "none"
+    } else {
+        &mp_config.config.quantization
+    };
+    let family_str = if mp_config.descriptor.family.is_empty() {
+        "<unknown>"
+    } else {
+        &mp_config.descriptor.family
+    };
+    let name_str = if mp_config.descriptor.name.is_empty() {
+        "<unknown>"
+    } else {
+        &mp_config.descriptor.name
+    };
     tracing::info!(
-        "ModelPack model: format={}, architecture={}, params={}, quantization={}, family={}, name={}",
-        if format.is_empty() { "<auto>" } else { &format },
-        if mp_config.config.architecture.is_empty() { "<unknown>" } else { &mp_config.config.architecture },
-        if mp_config.config.param_size.is_empty() { "?" } else { &mp_config.config.param_size },
-        if mp_config.config.quantization.is_empty() { "none" } else { &mp_config.config.quantization },
-        if mp_config.descriptor.family.is_empty() { "<unknown>" } else { &mp_config.descriptor.family },
-        if mp_config.descriptor.name.is_empty() { "<unknown>" } else { &mp_config.descriptor.name },
+        "ModelPack model: format={fmt_str}, arch={arch_str}, params={params_str}, \
+         quant={quant_str}, family={family_str}, name={name_str}"
     );
 
     let model_dir = bundle_path.join("model");
@@ -114,14 +137,8 @@ pub fn load_bundle(bundle_path: &Path) -> Result<ModelFiles> {
     );
 
     // ── Tokenizer config (optional) ─────────────────────────────────────
-    let tokenizer_config_path = {
-        let p = model_dir.join("tokenizer_config.json");
-        if p.exists() {
-            Some(p)
-        } else {
-            None
-        }
-    };
+    let p = model_dir.join("tokenizer_config.json");
+    let tokenizer_config_path = p.exists().then_some(p);
 
     // ── Detect weight format ────────────────────────────────────────────
     // Use the ModelPack config.format field first; fall back to scanning the
@@ -174,13 +191,13 @@ fn load_gguf_bundle(
         "ModelPack config says format=gguf but no .gguf files in {}",
         model_dir.display()
     );
-    if gguf_files.len() > 1 {
-        tracing::info!(
-            "Found {} GGUF shards; using first: {}",
-            gguf_files.len(),
-            gguf_files[0].display()
-        );
-    }
+    // Multiple GGUF files are ambiguous — require exactly one.
+    anyhow::ensure!(
+        gguf_files.len() == 1,
+        "Found {} GGUF files in {}; expected exactly one",
+        gguf_files.len(),
+        model_dir.display()
+    );
     tracing::info!("Loading GGUF weights from ModelPack bundle");
     Ok(ModelFiles {
         config_path,

@@ -10,7 +10,49 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::path::PathBuf;
+
+// ---------------------------------------------------------------------------
+// FFI declarations — linked against the Go C shared library (libocipull).
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    /// Pull an OCI model and return the bundle path.
+    /// Returns NULL on error (retrieve with `oci_last_error`).
+    /// Caller must free the returned string with `oci_free_string`.
+    fn oci_pull(reference: *const c_char) -> *mut c_char;
+
+    /// Get the bundle path for an already-pulled model.
+    /// Returns NULL if the model is not in the local store.
+    /// Caller must free the returned string with `oci_free_string`.
+    fn oci_bundle(reference: *const c_char) -> *mut c_char;
+
+    /// Return the last error message, or NULL if no error.
+    /// Caller must free the returned string with `oci_free_string`.
+    fn oci_last_error() -> *mut c_char;
+
+    /// Free a string returned by `oci_pull`, `oci_bundle`, or `oci_last_error`.
+    fn oci_free_string(s: *mut c_char);
+}
+
+/// Read and free the last error from the Go library.
+fn get_last_oci_error() -> String {
+    unsafe {
+        let err_ptr = oci_last_error();
+        if err_ptr.is_null() {
+            return "unknown error".to_string();
+        }
+        let msg = CStr::from_ptr(err_ptr).to_string_lossy().into_owned();
+        oci_free_string(err_ptr);
+        msg
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
 
 #[derive(Parser, Clone)]
 pub struct PullArgs {
@@ -53,6 +95,10 @@ pub struct PullArgs {
     pub quantize: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Reference classification
+// ---------------------------------------------------------------------------
+
 /// Classify a model reference into OCI or HuggingFace.
 #[derive(Debug, PartialEq)]
 pub enum RefKind {
@@ -66,7 +112,8 @@ pub enum RefKind {
 ///
 /// Rules (matching Docker Model Runner conventions):
 ///   - `hf.co/...` or `huggingface.co/...` → HuggingFace
-///   - Single word (no `/`) → OCI (docker.io/ai/<name>)
+///   - Single word (no `/`) → OCI.  The Go library is responsible for
+///     expanding this to `docker.io/ai/<name>` when calling the registry.
 ///   - Has explicit registry (dot before first `/`) → OCI
 ///   - `org/model` (no dots before first `/`) → HuggingFace
 pub fn classify_reference(reference: &str) -> RefKind {
@@ -93,63 +140,66 @@ pub fn classify_reference(reference: &str) -> RefKind {
     RefKind::Oci
 }
 
-/// Call the `inferrs-oci-pull` Go helper binary.
-///
-/// Returns the bundle path on success.
-pub fn oci_pull(reference: &str) -> Result<PathBuf> {
-    let helper = find_oci_helper()?;
+// ---------------------------------------------------------------------------
+// OCI operations (via FFI into the Go shared library)
+// ---------------------------------------------------------------------------
+
+/// Pull an OCI model and return its bundle path.
+pub fn oci_pull_model(reference: &str) -> Result<PathBuf> {
+    let c_ref = CString::new(reference).context("OCI reference contains interior NUL byte")?;
 
     tracing::info!("Pulling OCI model: {}", reference);
 
-    let output = std::process::Command::new(&helper)
-        .args(["pull", reference])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit()) // progress to terminal
-        .output()
-        .with_context(|| format!("Failed to run {}", helper.display()))?;
+    let result = unsafe { oci_pull(c_ref.as_ptr()) };
 
-    if !output.status.success() {
-        anyhow::bail!(
-            "inferrs-oci-pull failed with exit code {}",
-            output.status.code().unwrap_or(-1)
-        );
+    if result.is_null() {
+        let err = get_last_oci_error();
+        anyhow::bail!("OCI pull failed for '{}': {}", reference, err);
     }
 
-    let bundle_path = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 from inferrs-oci-pull")?
-        .trim()
-        .to_string();
+    let path_str = unsafe {
+        let s = CStr::from_ptr(result).to_string_lossy().into_owned();
+        oci_free_string(result);
+        s
+    };
 
-    if bundle_path.is_empty() {
-        anyhow::bail!("inferrs-oci-pull returned an empty bundle path");
+    if path_str.is_empty() {
+        anyhow::bail!("OCI pull returned an empty bundle path for '{}'", reference);
     }
 
-    Ok(PathBuf::from(bundle_path))
+    Ok(PathBuf::from(path_str))
 }
 
 /// Look up an already-pulled OCI model's bundle path without pulling.
 ///
 /// Returns `None` if the model is not in the local store.
-pub fn oci_bundle(reference: &str) -> Option<PathBuf> {
-    let helper = find_oci_helper().ok()?;
+pub fn oci_bundle_path(reference: &str) -> Option<PathBuf> {
+    let c_ref = CString::new(reference).ok()?;
 
-    let output = std::process::Command::new(&helper)
-        .args(["bundle", reference])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let result = unsafe { oci_bundle(c_ref.as_ptr()) };
 
-    if !output.status.success() {
+    if result.is_null() {
+        // [4] Log a warning when the lookup fails so silent failures are visible.
+        let err = get_last_oci_error();
+        tracing::warn!(
+            "OCI bundle lookup failed for '{}': {}; will attempt pull",
+            reference,
+            err,
+        );
         return None;
     }
 
-    let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if path.is_empty() {
+    let path_str = unsafe {
+        let s = CStr::from_ptr(result).to_string_lossy().into_owned();
+        oci_free_string(result);
+        s
+    };
+
+    if path_str.is_empty() {
         return None;
     }
 
-    let p = PathBuf::from(&path);
+    let p = PathBuf::from(&path_str);
     if p.exists() {
         Some(p)
     } else {
@@ -157,43 +207,25 @@ pub fn oci_bundle(reference: &str) -> Option<PathBuf> {
     }
 }
 
-/// Find the `inferrs-oci-pull` binary.
-///
-/// Search order:
-///   1. Next to the current executable (`./inferrs-oci-pull`)
-///   2. In `$PATH`
-fn find_oci_helper() -> Result<PathBuf> {
-    // 1. Next to our own binary
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe
-            .parent()
-            .unwrap_or(exe.as_ref())
-            .join("inferrs-oci-pull");
-        if sibling.exists() {
-            return Ok(sibling);
-        }
-    }
-
-    // 2. In PATH
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("inferrs-oci-pull");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "inferrs-oci-pull not found. Build it with:\n  \
-         cd oci-pull && go build -o ../target/debug/inferrs-oci-pull ."
-    )
-}
+// ---------------------------------------------------------------------------
+// `inferrs pull` entry point
+// ---------------------------------------------------------------------------
 
 pub fn run(args: PullArgs) -> Result<()> {
     match classify_reference(&args.model) {
         RefKind::Oci => {
-            let bundle_path = oci_pull(&args.model)?;
+            // [7] --revision is only meaningful for HuggingFace references.
+            if args.revision != "main" {
+                anyhow::bail!(
+                    "--revision is not supported for OCI references \
+                     (got --revision '{}' for OCI model '{}'). \
+                     Use an OCI tag instead, e.g. docker.io/org/model:v2",
+                    args.revision,
+                    args.model,
+                );
+            }
+
+            let bundle_path = oci_pull_model(&args.model)?;
             println!("Pulled {} (OCI)", args.model);
             println!("  bundle: {}", bundle_path.display());
         }

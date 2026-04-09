@@ -107,7 +107,7 @@ pub fn download_model(
     // This allows `inferrs run gemma3` and `inferrs serve docker.io/org/model`
     // to work seamlessly — reusing DMR's cache or pulling on demand.
     if let crate::pull::RefKind::Oci = crate::pull::classify_reference(model_id) {
-        let bundle_path = match crate::pull::oci_bundle(model_id) {
+        let bundle_path = match crate::pull::oci_bundle_path(model_id) {
             Some(p) => {
                 tracing::info!(
                     "Found OCI model in local store: {} → {}",
@@ -118,7 +118,7 @@ pub fn download_model(
             }
             None => {
                 tracing::info!("OCI model not cached, pulling: {}", model_id);
-                crate::pull::oci_pull(model_id)?
+                crate::pull::oci_pull_model(model_id)?
             }
         };
         return crate::modelpack::load_bundle(&bundle_path);
