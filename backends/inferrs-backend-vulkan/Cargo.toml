@@ -9,6 +9,13 @@ license = "Apache-2.0"
 name = "inferrs_backend_vulkan"
 crate-type = ["cdylib"]
 
-[dependencies]
-# Use libc for low-level dlopen to probe libvulkan without linking it.
+# POSIX platforms (Linux, Android, macOS): dlopen to probe for libvulkan
+# without linking against it at build time.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc = "0.2"
+
+# Windows (x86_64 and aarch64): LoadLibraryW / FreeLibrary to probe vulkan-1.dll.
+# FreeLibrary lives in Win32_Foundation (not Win32_System_LibraryLoader) in
+# windows-sys >= 0.59.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_Foundation"] }

@@ -9,11 +9,13 @@ license = "Apache-2.0"
 name = "inferrs"
 path = "src/main.rs"
 
-# On macOS, always enable Metal — in debug, release, and test builds alike.
+# On macOS: always enable Metal, and add libloading to probe for
+# the Vulkan/MoltenVK plugin at runtime.
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
 candle-transformers = { workspace = true, features = ["metal"] }
+libloading = "0.8"
 
 
 [dependencies]
@@ -65,15 +67,15 @@ base64 = "0.22"
 # candle-core is patched (see [patch.crates-io] in the workspace Cargo.toml)
 # to use cudarc with fallback-dynamic-loading instead of dynamic-linking,
 # so libcuda / libcurand / libcublas are NOT hard-linked into the binary —
-# they are dlopen'd (LoadLibrary on Windows) on demand when a CUDA device
-# is first used.
+# they are dlopen'd on demand when a CUDA device is first used.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
 candle-core = { workspace = true, features = ["cuda"] }
 candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda"] }
 
-# Windows x86_64 only: CUDA is not available on Windows ARM.
+# Windows x86_64: CUDA + ROCm + Vulkan plugin probing.
+# CUDA is not available on Windows ARM, so this block is x86_64-only.
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 libloading = "0.8"
 candle-core = { workspace = true, features = ["cuda"] }
@@ -91,15 +93,10 @@ libloading = "0.8"
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
-# Windows aarch64 (Snapdragon X / 8cx): no CUDA, but Hexagon probing via
-# the plugin system needs libloading.
+# Windows aarch64 (Snapdragon X / 8cx): no CUDA, but Hexagon + Vulkan probing
+# via the plugin system needs libloading.
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
 libloading = "0.8"
-
-# macOS: Metal is linked directly, but libloading is still needed for the
-# macOS plugin extension point to compile cleanly.
-[target.'cfg(target_os = "macos")'.dependencies.libloading]
-version = "0.8"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }

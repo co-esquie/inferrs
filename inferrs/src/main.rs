@@ -228,11 +228,22 @@ impl ServeArgs {
 
     fn auto_device() -> Result<candle_core::Device> {
         // macOS: always prefer Metal (linked directly, no plugin needed).
+        // After that, probe for a Vulkan/MoltenVK plugin as a fallback.
         #[cfg(target_os = "macos")]
         {
             if let Ok(device) = candle_core::Device::new_metal(0) {
                 tracing::info!("Using Metal device");
                 return Ok(device);
+            }
+
+            // Metal failed (unlikely). Check whether a Vulkan/MoltenVK plugin
+            // is present so the user gets a helpful log message.
+            use crate::backend::BackendKind;
+            if let BackendKind::Vulkan = crate::backend::detect_backend() {
+                tracing::info!(
+                    "Vulkan/MoltenVK driver detected but candle 0.8 has no \
+                     Vulkan Device yet — falling back to CPU."
+                );
             }
         }
 
@@ -337,25 +348,75 @@ impl ServeArgs {
             }
         }
 
-        // Android (aarch64): probe CANN plugin for Huawei Ascend NPU.
+        // Android: probe CANN (Huawei Ascend NPU) then Vulkan.
         // CUDA and ROCm are not available on Android.
         #[cfg(target_os = "android")]
         {
             use crate::backend::BackendKind;
             match crate::backend::detect_backend() {
                 BackendKind::Cann => {
-                    // Huawei Ascend NPU on Android — same candle limitation
-                    // as on Linux: fall back to CPU until candle CANN lands.
                     tracing::info!(
                         "Huawei Ascend NPU detected (CANN) on Android but \
                          candle does not yet have a native CANN Device — \
                          falling back to CPU."
                     );
                 }
+                BackendKind::Vulkan => {
+                    tracing::info!(
+                        "Vulkan driver detected but candle 0.8 has no Vulkan \
+                         Device yet — falling back to CPU."
+                    );
+                }
                 BackendKind::Cpu => {}
             }
         }
 
+        // Windows x86_64: CUDA + MUSA + ROCm + Vulkan plugin probing.
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            use crate::backend::BackendKind;
+            match crate::backend::detect_backend() {
+                BackendKind::Cuda => {
+                    let device = candle_core::Device::new_cuda(0)?;
+                    tracing::info!("Using CUDA device (via plugin)");
+                    disable_cuda_event_tracking(&device);
+                    return Ok(device);
+                }
+                BackendKind::Musa => {
+                    let device = candle_core::Device::new_cuda(0)?;
+                    tracing::info!("Using MUSA device / Moore Threads GPU (via plugin)");
+                    disable_cuda_event_tracking(&device);
+                    return Ok(device);
+                }
+                BackendKind::Rocm => {
+                    let device = candle_core::Device::new_cuda(0)?;
+                    tracing::info!("Using ROCm device (via plugin)");
+                    disable_cuda_event_tracking(&device);
+                    return Ok(device);
+                }
+                BackendKind::Vulkan => {
+                    tracing::info!(
+                        "Vulkan driver detected but candle 0.8 has no Vulkan \
+                         Device yet — falling back to CPU. Recompile with a \
+                         candle version that supports wgpu to enable Vulkan."
+                    );
+                }
+                BackendKind::Cpu => {}
+            }
+        }
+
+        // Windows aarch64: Vulkan-only (CUDA unavailable on ARM64 Windows).
+        #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+        {
+            use crate::backend::BackendKind;
+            if let BackendKind::Vulkan = crate::backend::detect_backend() {
+                tracing::info!(
+                    "Vulkan driver detected but candle 0.8 has no Vulkan \
+                     Device yet — falling back to CPU. Recompile with a \
+                     candle version that supports wgpu to enable Vulkan."
+                );
+            }
+        }
         tracing::info!("Using CPU device");
         Ok(candle_core::Device::Cpu)
     }
