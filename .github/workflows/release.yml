@@ -100,6 +100,14 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-gnu \
             -p inferrs-backend-rocm
 
+      # ── MUSA backend plugin (no GPU toolchain needed at compile time) ───
+      # The MUSA plugin probes libmusart.so via dlopen at runtime; building it
+      # only requires the Rust toolchain, so no MUSA SDK install is needed here.
+      - name: Build MUSA backend plugin
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-musa
+
       # ── Vulkan backend plugin (no GPU toolchain needed) ──────────────────
       - name: Build Vulkan backend plugin
         run: |
@@ -116,10 +124,11 @@ jobs:
           # Main binary
           cp "$RELEASE_DIR/inferrs" "$STAGE/"
 
-          # Backend plugins (ship all three; the binary picks the right one at
+          # Backend plugins (ship all; the binary picks the right one at
           # runtime via dlopen — missing plugins are silently skipped)
           for lib in \
             libinferrs_backend_cuda.so \
+            libinferrs_backend_musa.so \
             libinferrs_backend_rocm.so \
             libinferrs_backend_vulkan.so; do
             if [ -f "$RELEASE_DIR/$lib" ]; then
@@ -189,6 +198,12 @@ jobs:
           cargo build --release --target aarch64-unknown-linux-gnu \
             -p inferrs-backend-rocm
 
+      # ── MUSA backend plugin (aarch64: Moore Threads ships SDK for ARM) ──
+      - name: Build MUSA backend plugin
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs-backend-musa
+
       # ── Vulkan backend plugin (arm64 systems can have Vulkan drivers) ────
       - name: Build Vulkan backend plugin
         run: |
@@ -204,6 +219,7 @@ jobs:
           cp "$RELEASE_DIR/inferrs" "$STAGE/"
           for lib in \
             libinferrs_backend_cuda.so \
+            libinferrs_backend_musa.so \
             libinferrs_backend_rocm.so \
             libinferrs_backend_vulkan.so; do
             [ -f "$RELEASE_DIR/$lib" ] && cp "$RELEASE_DIR/$lib" "$STAGE/"
@@ -290,6 +306,14 @@ jobs:
           cargo build --release --target x86_64-pc-windows-msvc `
             -p inferrs-backend-rocm
 
+      # ── MUSA backend plugin (no compile-time MUSA SDK dependency) ────────
+      # The MUSA plugin has no compile-time MUSA SDK dependency so it can be
+      # built with the standard MSVC toolchain that is already available here.
+      - name: Build MUSA backend plugin
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc `
+            -p inferrs-backend-musa
+
       # Note: inferrs-backend-vulkan is intentionally NOT built for Windows.
       # The Vulkan probe body is cfg(not(target_os = "linux")) → always returns
       # 1 (unavailable), so shipping the DLL would waste space with no benefit.
@@ -307,6 +331,7 @@ jobs:
           # LoadLibrary search (next to the executable) finds them automatically.
           foreach ($dll in @(
             "inferrs_backend_cuda.dll",
+            "inferrs_backend_musa.dll",
             "inferrs_backend_rocm.dll"
           )) {
             if (Test-Path "$releaseDir\$dll") {
@@ -449,19 +474,20 @@ jobs:
               end
             end
 
-            def install
-              bin.install "inferrs"
+             def install
+               bin.install "inferrs"
 
-              # Install GPU backend plugins alongside the binary so the
-              # inferrs binary can find them via dlopen at runtime.
-              %w[
-                libinferrs_backend_cuda.so
-                libinferrs_backend_rocm.so
-                libinferrs_backend_vulkan.so
-              ].each do |plugin|
-                bin.install plugin if File.exist?(plugin)
-              end
-            end
+               # Install GPU backend plugins alongside the binary so the
+               # inferrs binary can find them via dlopen at runtime.
+               %w[
+                 libinferrs_backend_cuda.so
+                 libinferrs_backend_musa.so
+                 libinferrs_backend_rocm.so
+                 libinferrs_backend_vulkan.so
+               ].each do |plugin|
+                 bin.install plugin if File.exist?(plugin)
+               end
+             end
 
             test do
               assert_match "inferrs", shell_output("#{bin}/inferrs --help")

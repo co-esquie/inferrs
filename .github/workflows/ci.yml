@@ -25,7 +25,9 @@ jobs:
         with:
           components: rustfmt
       # Format-check only the packages that don't require GPU toolchains.
-      - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
+      # inferrs-backend-musa has no MUSA SDK dependency at compile time (it
+      # probes libmusart.so via dlopen at runtime) so it can be checked here.
+      - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
 
   clippy:
     name: Clippy
@@ -43,7 +45,9 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-      - run: cargo clippy -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan -- -D warnings
+      # inferrs-backend-musa is included here for the same reason as fmt: it has
+      # no compile-time MUSA SDK dependency.
+      - run: cargo clippy -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan -- -D warnings
 
   build:
     name: Build (${{ matrix.target }})
@@ -125,7 +129,11 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-            cargo test --no-run -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
+            # --no-run: the test binary crashes at startup without nvcuda.dll
+            # on GPU-less CI runners; just verify compilation succeeds.
+            cargo test --no-run -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
           else
-            cargo test -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
+            # inferrs-backend-musa has no compile-time MUSA SDK dependency, so
+            # it builds and runs (probe returns 1 = unavailable) on all runners.
+            cargo test -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
           fi

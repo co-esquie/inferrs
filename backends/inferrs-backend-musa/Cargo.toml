@@ -1,0 +1,17 @@
+[package]
+name = "inferrs-backend-musa"
+version = "0.1.0"
+edition = "2021"
+description = "MUSA (Moore Threads GPU) backend plugin for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_musa"
+crate-type = ["cdylib"]
+
+[dependencies]
+# libloading wraps dlopen (Linux/macOS) and LoadLibraryW (Windows) behind a
+# safe Rust API.  We use it to open the MUSA runtime library at probe time
+# without linking it at compile time, so the plugin carries no build-time
+# dependency on the MUSA SDK.
+libloading = "0.8"

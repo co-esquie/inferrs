@@ -38,16 +38,18 @@
 //!
 //! **Linux x86_64 / aarch64:**
 //!   1. CUDA   (`.so`)  → `Device::new_cuda(0)`
-//!   2. ROCm   (`.so`)  → `Device::new_cuda(0)` (HIP)
-//!   3. CANN   (`.so`)  → CPU fallback with info log (pending candle CANN Device)
-//!   4. Vulkan (`.so`)  → CPU fallback with info log
-//!   5. CPU    (always available)
+//!   2. MUSA   (`.so`)  → `Device::new_cuda(0)` (Moore Threads)
+//!   3. ROCm   (`.so`)  → `Device::new_cuda(0)` (HIP)
+//!   4. CANN   (`.so`)  → CPU fallback with info log (pending candle CANN Device)
+//!   5. Vulkan (`.so`)  → CPU fallback with info log
+//!   6. CPU    (always available)
 //!
 //! **Windows x86_64:**
 //!   1. CUDA   (`.dll`) → `Device::new_cuda(0)`
-//!   2. ROCm   (`.dll`) → `Device::new_cuda(0)` (HIP SDK for Windows)
-//!   3. Vulkan (`.dll`) → CPU fallback with info log
-//!   4. CPU    (always available)
+//!   2. MUSA   (`.dll`) → `Device::new_cuda(0)` (Moore Threads)
+//!   3. ROCm   (`.dll`) → `Device::new_cuda(0)` (HIP SDK for Windows)
+//!   4. Vulkan (`.dll`) → CPU fallback with info log
+//!   5. CPU    (always available)
 //!
 //! **Android aarch64:**
 //!   1. CANN   (`.so`)  → CPU fallback with info log (pending candle CANN Device)
@@ -69,6 +71,10 @@ mod linux {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
         Cuda,
+        /// Moore Threads GPU (MUSA SDK).  Uses the same `Device::new_cuda(0)`
+        /// path in candle-core as NVIDIA CUDA, because the MUSA SDK mirrors
+        /// the CUDA API.  The plugin probes for `libmusart.so` at runtime.
+        Musa,
         Rocm,
         /// Huawei Ascend NPU via CANN (Compute Architecture for Neural Networks).
         ///
@@ -93,18 +99,23 @@ mod linux {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → ROCm → CANN → Vulkan → CPU.
-        // Both x86_64 and aarch64 Linux support CUDA and ROCm.
+        // Priority order: CUDA → MUSA → ROCm → CANN → Vulkan → CPU.
+        // Both x86_64 and aarch64 Linux support CUDA, MUSA, and ROCm.
         //
-        // CANN (Huawei Ascend NPU) is placed after CUDA and ROCm so that a
-        // system with both an NVIDIA/AMD GPU and an Ascend NPU prefers the
-        // GPU.  CANN is placed before Vulkan because it represents dedicated
-        // neural-network silicon rather than a general graphics API.
+        // MUSA (Moore Threads) mirrors the CUDA API; its plugin probes
+        // `libmusart.so` without any compile-time dependency, so it is safe
+        // to ship on systems without a MUSA driver installed.
+        //
+        // CANN (Huawei Ascend NPU) is placed after CUDA/MUSA/ROCm so that a
+        // system with both a GPU and an Ascend NPU prefers the GPU.  CANN is
+        // placed before Vulkan because it represents dedicated neural-network
+        // silicon rather than a general graphics API.
         //
         // The CANN plugin is arch-gated at build time (x86_64 / aarch64 only)
         // so on unsupported architectures the `.so` simply won't exist.
         let candidates: &[(&str, BackendKind)] = &[
             ("libinferrs_backend_cuda.so", BackendKind::Cuda),
+            ("libinferrs_backend_musa.so", BackendKind::Musa),
             ("libinferrs_backend_rocm.so", BackendKind::Rocm),
             ("libinferrs_backend_cann.so", BackendKind::Cann),
             ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
@@ -303,6 +314,9 @@ mod windows {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
         Cuda,
+        /// Moore Threads GPU (MUSA SDK).  Uses `Device::new_cuda(0)` because
+        /// MUSA mirrors the CUDA API.  The plugin probes `musa.dll` at runtime.
+        Musa,
         /// ROCm/HIP device (AMD GPU via ROCm 5.5+ HIP SDK for Windows).
         Rocm,
         /// Vulkan is detected but candle 0.8 has no Vulkan Device variant yet.
@@ -318,11 +332,13 @@ mod windows {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → ROCm → Vulkan → CPU.
+        // Priority order: CUDA → MUSA → ROCm → Vulkan → CPU.
         // ROCm on Windows x86_64 is supported via AMD's HIP SDK (ROCm 5.5+).
+        // MUSA Windows support is announced by Moore Threads.
         // CANN is not supported on Windows (Huawei SDK constraint).
         let candidates: &[(&str, BackendKind)] = &[
             ("inferrs_backend_cuda.dll", BackendKind::Cuda),
+            ("inferrs_backend_musa.dll", BackendKind::Musa),
             ("inferrs_backend_rocm.dll", BackendKind::Rocm),
             ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
         ];

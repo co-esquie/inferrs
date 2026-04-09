@@ -4,6 +4,7 @@ members = [
     "inferrs-benchmark",
     "backends/inferrs-backend-cann",
     "backends/inferrs-backend-cuda",
+    "backends/inferrs-backend-musa",
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
 ]
@@ -14,9 +15,12 @@ members = [
 #   cargo build -p inferrs-backend-rocm     (requires hipcc / ROCm)
 #   cargo build -p inferrs-backend-cann     (Linux/Android only; requires
 #                                            libascendcl.so from CANN SDK)
+# The MUSA backend has no compile-time SDK dependency (it probes libmusart.so
+# via dlopen at runtime) so it is included in default-members.
 default-members = [
     "inferrs",
     "inferrs-benchmark",
+    "backends/inferrs-backend-musa",
     "backends/inferrs-backend-vulkan",
 ]
 resolver = "2"

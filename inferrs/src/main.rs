@@ -254,6 +254,18 @@ impl ServeArgs {
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
+                BackendKind::Musa => {
+                    // Moore Threads MUSA mirrors the CUDA API.  candle-core's
+                    // `cuda` feature covers MUSA when the binary is loaded in
+                    // an environment with the MUSA runtime libraries present.
+                    // `Device::new_cuda(0)` resolves through cudarc's
+                    // fallback-dynamic-loading, which at runtime binds to the
+                    // MUSA-compatible symbols instead of the NVIDIA ones.
+                    let device = candle_core::Device::new_cuda(0)?;
+                    tracing::info!("Using MUSA device / Moore Threads GPU (via plugin)");
+                    disable_cuda_event_tracking(&device);
+                    return Ok(device);
+                }
                 BackendKind::Rocm => {
                     // ROCm uses the same HIP/CUDA device path in candle.
                     // Supported on Linux x86_64, Linux aarch64, and Windows
