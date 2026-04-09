@@ -2572,4 +2572,78 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].content.0, "Available tools:\n- noop");
     }
+
+    #[test]
+    fn format_tools_marks_required_parameters() {
+        // Required parameters must not have the '?' suffix; optional ones must.
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search the web",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }
+        ]);
+        let result = format_tools_as_system_context(&tools);
+        // "query" is required — no '?' marker.
+        assert!(
+            result.contains("query: string"),
+            "required param should have no '?' suffix"
+        );
+        // "limit" is optional — must have '?' marker.
+        assert!(
+            result.contains("limit?: integer"),
+            "optional param must have '?' suffix"
+        );
+    }
+
+    #[test]
+    fn inject_tools_full_openclaw_agent_request_does_not_crash() {
+        // Simulate the full set of messages OpenClaw sends on a realistic agent
+        // turn: system prompt, user message, assistant tool-call (null content),
+        // tool result, and a follow-up user message.  The tool injection logic
+        // must produce a message list that the tokenizer templates can render
+        // without panicking.
+        use crate::tokenizer::Role;
+
+        let tool_summary =
+            "Available tools:\n- get_weather: Get current weather\n  parameters: city: string";
+        let messages: Vec<ChatMessage> = serde_json::from_str(
+            r#"[
+                {"role":"system","content":"You are helpful."},
+                {"role":"user","content":"What is the weather in Paris?"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"18°C, partly cloudy"},
+                {"role":"user","content":"Thanks!"}
+            ]"#,
+        )
+        .unwrap();
+
+        let result = inject_tools_into_messages(&messages, tool_summary);
+
+        // Injection merges tool summary into the existing system message.
+        assert_eq!(
+            result.len(),
+            messages.len(),
+            "message count must not change"
+        );
+        assert!(matches!(result[0].role, Role::System));
+        assert!(result[0].content.0.contains("You are helpful."));
+        assert!(result[0].content.0.contains("Available tools:"));
+        // Remaining messages are unchanged.
+        assert!(matches!(result[1].role, Role::User));
+        assert!(matches!(result[2].role, Role::Assistant));
+        assert!(result[2].tool_calls.is_some());
+        assert!(matches!(result[3].role, Role::Tool));
+        assert!(matches!(result[4].role, Role::User));
+    }
 }
