@@ -885,6 +885,30 @@ async fn chat_completions(
     //      the engine thread which owns the model weights)
     let has_audio = req.messages.iter().any(|m| m.audio.is_some());
 
+    // When the caller provides tool definitions (e.g. from an OpenClaw agent
+    // runtime), prepend a synthetic system message that describes the available
+    // tools in plain text.  This gives models that do not natively process
+    // OpenAI tool schemas (e.g. Gemma) the information they need to reason
+    // about tool calls, without triggering schema-validation failures inside
+    // the model or the chat template renderer.
+    //
+    // If the message list already begins with a system message the tool
+    // summary is appended to it so the context stays in a single system turn
+    // (avoiding two consecutive system messages which some templates reject).
+    // Done before the audio/non-audio split so both paths share one injection.
+    let messages_with_tools: Vec<ChatMessage>;
+    let messages = if let Some(ref tools) = req.tools {
+        tracing::info!(
+            "Request {}: tools provided — injecting as system context",
+            request_id
+        );
+        let tool_summary = format_tools_as_system_context(tools);
+        messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
+        &messages_with_tools[..]
+    } else {
+        &req.messages[..]
+    };
+
     let (prompt_tokens, audio_ctx) = if has_audio {
         let audio_token_id = state.audio_token_id.ok_or_else(|| {
             audio_error("This model does not support audio input (no audio_token_id in config)")
@@ -923,7 +947,7 @@ async fn chat_completions(
         let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
 
         // Tokenize with audio soft-token placeholders.
-        let prompt = apply_gemma4_with_audio(&req.messages, &[n_audio_tokens]);
+        let prompt = apply_gemma4_with_audio(messages, &[n_audio_tokens]);
         let tokenizer = state
             .tokenizer
             .as_deref()
@@ -953,29 +977,6 @@ async fn chat_completions(
             .tokenizer
             .as_deref()
             .ok_or_else(|| server_error("No model loaded"))?;
-
-        // When the caller provides tool definitions (e.g. from an OpenClaw agent
-        // runtime), prepend a synthetic system message that describes the available
-        // tools in plain text.  This gives models that do not natively process
-        // OpenAI tool schemas (e.g. Gemma) the information they need to reason
-        // about tool calls, without triggering schema-validation failures inside
-        // the model or the chat template renderer.
-        //
-        // If the message list already begins with a system message the tool
-        // summary is appended to it so the context stays in a single system turn
-        // (avoiding two consecutive system messages which some templates reject).
-        let messages_with_tools: Vec<ChatMessage>;
-        let messages = if let Some(ref tools) = req.tools {
-            tracing::info!(
-                "Request {}: tools provided — injecting as system context for prompt-only rendering",
-                request_id
-            );
-            let tool_summary = format_tools_as_system_context(tools);
-            messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
-            &messages_with_tools[..]
-        } else {
-            &req.messages[..]
-        };
 
         let tokens = match tokenizer.apply_chat_template_and_encode(messages) {
             Ok(t) => t,
