@@ -56,6 +56,7 @@ fn main() {
     // This is what makes "brew install inferrs" viable as a single binary
     // that dlopens whatever CUDA libs are present at runtime (12.x, 13.x, …)
     // and falls back cleanly on systems without CUDA at all.
+    //
     // `rustc-link-lib=static=` propagates from lib build scripts to downstream
     // binaries (unlike `rustc-link-arg`, which only applies to the current
     // compilation unit — a no-op for a lib crate).  We also need to be robust
@@ -69,24 +70,23 @@ fn main() {
     // We probe every plausible directory and add those that exist as native
     // search paths, so rustc can resolve `-l static=cudart_static` regardless
     // of which layout the host toolkit ships.
-    let cuda_path = std::env::var("CUDA_PATH").unwrap_or_else(|_| {
-        if is_target_msvc {
-            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6".to_string()
-        } else {
-            "/usr/local/cuda".to_string()
+    //
+    // When `CUDA_PATH` is not set, we try a platform-specific list of default
+    // install roots: the conventional `/usr/local/cuda` on Unix, and the
+    // `NVIDIA GPU Computing Toolkit\CUDA\vXX.Y` directories on Windows (newest
+    // first).  Setting `CUDA_PATH` explicitly is still recommended.
+    let cuda_path_env = std::env::var("CUDA_PATH").ok();
+    let cuda_roots: Vec<String> = match cuda_path_env.as_deref() {
+        Some(p) => vec![p.to_string()],
+        None if is_target_msvc => {
+            let base = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA";
+            // Newest first — the linker will use whichever exists.
+            ["v13.2", "v13.1", "v13.0", "v12.9", "v12.8", "v12.6", "v12.0"]
+                .iter()
+                .map(|v| format!("{base}/{v}"))
+                .collect()
         }
-    });
-
-    let search_dirs: Vec<String> = if is_target_msvc {
-        vec![format!("{cuda_path}/lib/x64")]
-    } else {
-        vec![
-            format!("{cuda_path}/lib64"),
-            format!("{cuda_path}/lib"),
-            format!("{cuda_path}/targets/x86_64-linux/lib"),
-            format!("{cuda_path}/targets/sbsa-linux/lib"),
-            format!("{cuda_path}/targets/aarch64-linux/lib"),
-        ]
+        None => vec!["/usr/local/cuda".to_string()],
     };
 
     let lib_filename = if is_target_msvc {
@@ -94,6 +94,25 @@ fn main() {
     } else {
         "libcudart_static.a"
     };
+
+    let layout_subdirs: &[&str] = if is_target_msvc {
+        &["lib/x64"]
+    } else {
+        &[
+            "lib64",
+            "lib",
+            "targets/x86_64-linux/lib",
+            "targets/sbsa-linux/lib",
+            "targets/aarch64-linux/lib",
+        ]
+    };
+
+    let mut search_dirs: Vec<String> = Vec::new();
+    for root in &cuda_roots {
+        for sub in layout_subdirs {
+            search_dirs.push(format!("{root}/{sub}"));
+        }
+    }
 
     let mut resolved = false;
     for dir in &search_dirs {
@@ -105,27 +124,25 @@ fn main() {
         }
     }
     if !resolved {
+        let hint = if cuda_path_env.is_none() {
+            " — set CUDA_PATH to your CUDA toolkit root (e.g. /usr/local/cuda \
+             or C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6)"
+        } else {
+            ""
+        };
         println!(
             "cargo:warning=candle-kernels: could not locate {lib_filename} under \
-             CUDA_PATH={cuda_path}; the final link step is likely to fail with \
+             any of {search_dirs:?}{hint}; the final link step will fail with \
              undefined cudart symbols."
         );
-        // Still add the canonical lib64 path as a last-ditch effort — the
-        // linker may find the file even if our probe missed it (e.g. via a
-        // symlink chain we didn't walk).
+        // Still add the probed paths as a last-ditch effort — the linker may
+        // find the file even if our probe missed it (e.g. via a symlink chain
+        // we didn't walk).
         for dir in &search_dirs {
             println!("cargo:rustc-link-search=native={dir}");
         }
     }
 
-    // Statically link the CUDA runtime instead of hard-linking libcudart.so.
-    // libcudart_static.a resolves the CUDA driver API (libcuda.so) via
-    // dlopen/dlsym internally, so the final binary ends up with NO DT_NEEDED
-    // entries for libcudart / libcuda / libcublas / libcurand — matching the
-    // behaviour already achieved for cudarc via `fallback-dynamic-loading`.
-    // This is what makes "brew install inferrs" viable as a single binary
-    // that dlopens whatever CUDA libs are present at runtime (12.x, 13.x, …)
-    // and falls back cleanly on systems without CUDA at all.
     println!("cargo:rustc-link-lib=static=cudart_static");
     if !is_target_msvc {
         // cudart_static uses dlopen and POSIX realtime clocks internally.

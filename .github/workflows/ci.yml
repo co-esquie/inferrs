@@ -102,11 +102,29 @@ jobs:
       # adds cl.exe to PATH (required by nvcc on Windows to compile CUDA kernels).
       - name: Install CUDA toolkit (Windows x86_64)
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        id: cuda-toolkit-windows
         uses: Jimver/cuda-toolkit@v0.2.22
         with:
           cuda: '12.6.0'
           method: network
           sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev", "curand", "curand_dev"]'
+
+      # Jimver/cuda-toolkit already sets CUDA_PATH in the runner environment,
+      # but pin it explicitly so candle-kernels/build.rs can't silently fall
+      # back to its hardcoded default if a future version of the action
+      # changes that behavior.  Fail fast with a clear message if CUDA_PATH
+      # is somehow unset — otherwise the link step will later fail deep in
+      # nvcc output with undefined cudart_static symbols.
+      - name: Export CUDA_PATH for build.rs (Windows x86_64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH) {
+            Write-Error "CUDA_PATH is not set after Jimver/cuda-toolkit install"
+            exit 1
+          }
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          echo "CUDA_PATH=$env:CUDA_PATH" >> $env:GITHUB_ENV
 
       - name: Set up MSVC environment (Windows x86_64 — nvcc needs cl.exe)
         if: matrix.target == 'x86_64-pc-windows-msvc'
