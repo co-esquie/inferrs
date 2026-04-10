@@ -4,6 +4,7 @@ use criterion::criterion_main;
 
 criterion_main!(
     benchmarks::affine::benches,
+    benchmarks::conv1d_depthwise::benches,
     benchmarks::binary::benches,
     benchmarks::broadcast::benches,
     benchmarks::copy::benches,
