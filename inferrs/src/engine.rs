@@ -16,6 +16,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -280,6 +281,15 @@ pub struct StreamToken {
     /// matching vllm's `--reasoning-parser` and llama-server's default behaviour.
     pub reasoning_content: String,
     pub finish_reason: Option<String>,
+    /// Wall time from request start to finish (nanoseconds).
+    /// Only populated on the final chunk (when `finish_reason.is_some()`).
+    pub total_duration_ns: Option<u128>,
+    /// Prefill (prompt evaluation) time in nanoseconds.
+    /// Only populated on the final chunk.
+    pub prompt_eval_duration_ns: Option<u128>,
+    /// Decode time for output tokens in nanoseconds.
+    /// Only populated on the final chunk.
+    pub eval_duration_ns: Option<u128>,
 }
 
 /// Classification of a single generated token with respect to the thinking block.
@@ -346,16 +356,40 @@ impl ThinkFilter {
                 close_ids.push(id);
             }
         }
+
+        // Fallback: some tokenizers (e.g. Gemma4 GGUF-loaded) don't expose
+        // added tokens via `token_to_id`.  Try looking up the token string
+        // from the vocab by ID for known positions.
+        if open_ids.is_empty() {
+            // Try well-known IDs for common thinking model families.
+            // Gemma4: <|think|> = 98
+            for known_id in [98u32] {
+                if let Some(text) = tokenizer.id_to_token(known_id) {
+                    if text.contains("think") {
+                        tracing::debug!(
+                            "ThinkFilter: found thinking token via fallback: '{}' = ID {}",
+                            text,
+                            known_id,
+                        );
+                        open_ids.push(known_id);
+                        close_ids.push(known_id); // toggle style
+                    }
+                }
+            }
+        }
+
         // Deduplicate
         open_ids.dedup();
         close_ids.dedup();
 
         if !open_ids.is_empty() {
             tracing::debug!(
-                "ThinkFilter: open_ids={:?} close_ids={:?}",
+                "ThinkFilter enabled: open_ids={:?} close_ids={:?}",
                 open_ids,
                 close_ids
             );
+        } else {
+            tracing::debug!("ThinkFilter: no thinking tokens found, filter disabled");
         }
         Self {
             think_token_ids: open_ids, // reused as open_ids
@@ -382,6 +416,17 @@ impl ThinkFilter {
             TokenKind::Content
         }
     }
+
+    /// Check if a token ID is a thinking-block opening delimiter.
+    pub fn is_open_delimiter(&self, token_id: u32) -> bool {
+        self.think_token_ids.contains(&token_id)
+    }
+
+    /// Pre-set the thinking state (e.g. when the prompt already ends with
+    /// a `<|think|>` token, the model starts "inside" the thinking block).
+    pub fn set_in_think(&mut self, value: bool) {
+        self.in_think = value;
+    }
 }
 
 /// Result of a non-streaming generation.
@@ -390,9 +435,18 @@ pub struct GenerationResult {
     #[allow(dead_code)]
     pub output_token_ids: Vec<u32>,
     pub output_text: String,
+    /// Reasoning/thinking text separated from the main content.
+    /// Empty when thinking is not active or the model produced no reasoning.
+    pub reasoning_content: String,
     pub finish_reason: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    /// Wall time from request start to finish (nanoseconds).
+    pub total_duration_ns: u128,
+    /// Prefill (prompt evaluation) time in nanoseconds.
+    pub prompt_eval_duration_ns: u128,
+    /// Decode time for output tokens in nanoseconds.
+    pub eval_duration_ns: u128,
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +496,13 @@ impl TokenSink {
     }
 
     /// Send an error response appropriate to the channel type.
-    fn send_error(&mut self, error: &anyhow::Error, prompt_len: usize) {
+    fn send_error(
+        &mut self,
+        error: &anyhow::Error,
+        prompt_len: usize,
+        timing_ns: (u128, u128, u128),
+    ) {
+        let (total_duration_ns, prompt_eval_duration_ns, eval_duration_ns) = timing_ns;
         match self {
             TokenSink::Streaming {
                 request_id,
@@ -455,6 +515,9 @@ impl TokenSink {
                         text: format!("Error: {error}"),
                         reasoning_content: String::new(),
                         finish_reason: Some("error".to_string()),
+                        total_duration_ns: Some(total_duration_ns),
+                        prompt_eval_duration_ns: Some(prompt_eval_duration_ns),
+                        eval_duration_ns: Some(eval_duration_ns),
                     },
                 );
             }
@@ -463,9 +526,13 @@ impl TokenSink {
                     let _ = tx.send(GenerationResult {
                         output_token_ids: vec![],
                         output_text: format!("Error: {error}"),
+                        reasoning_content: String::new(),
                         finish_reason: "error".to_string(),
                         prompt_tokens: prompt_len,
                         completion_tokens: 0,
+                        total_duration_ns,
+                        prompt_eval_duration_ns,
+                        eval_duration_ns,
                     });
                 }
             }
@@ -495,6 +562,17 @@ struct ActiveSequence {
     finished: bool,
     /// Suppresses thinking-block tokens before they reach the client.
     think_filter: ThinkFilter,
+    /// Wall clock time when the sequence was admitted to the engine.
+    start_time: Instant,
+    /// Wall clock time when the prefill phase completed.  `None` until the
+    /// first decode step runs.
+    prefill_end: Option<Instant>,
+    /// Token IDs classified as reasoning (inside `<think>…</think>`).
+    /// Accumulated during decode for the non-streaming GenerationResult.
+    reasoning_tokens: Vec<u32>,
+    /// Token IDs classified as visible content.
+    /// Accumulated during decode for the non-streaming GenerationResult.
+    content_tokens: Vec<u32>,
 }
 
 impl ActiveSequence {
@@ -527,6 +605,10 @@ impl ActiveSequence {
                     prefilled: false,
                     finished: false,
                     think_filter: ThinkFilter::default(),
+                    start_time: Instant::now(),
+                    prefill_end: None,
+                    reasoning_tokens: Vec::new(),
+                    content_tokens: Vec::new(),
                 }
             }
             EngineRequest::GenerateStream {
@@ -554,6 +636,10 @@ impl ActiveSequence {
                     prefilled: false,
                     finished: false,
                     think_filter: ThinkFilter::default(),
+                    start_time: Instant::now(),
+                    prefill_end: None,
+                    reasoning_tokens: Vec::new(),
+                    content_tokens: Vec::new(),
                 }
             }
         }
@@ -576,16 +662,65 @@ impl ActiveSequence {
         if let (Some(bt), Some(pool)) = (&mut self.block_table, block_pool) {
             bt.free_all(pool);
         }
+        let (total_duration_ns, prompt_eval_duration_ns, eval_duration_ns) = self.timing_ns();
+        // Decode content and reasoning tokens separately so the blocking
+        // path gets the same structured separation that streaming gets via
+        // the per-token ThinkFilter classification.
+        let output_text = if self.content_tokens.is_empty() {
+            if self.reasoning_tokens.is_empty() {
+                // No classification happened (e.g. no thinking model) — decode all.
+                tokenizer
+                    .decode(&self.output_tokens, true)
+                    .unwrap_or_default()
+            } else {
+                // All output was reasoning tokens (model never closed the thinking block).
+                String::new()
+            }
+        } else {
+            tokenizer
+                .decode(&self.content_tokens, true)
+                .unwrap_or_default()
+        };
+        let reasoning_content = if self.reasoning_tokens.is_empty() {
+            String::new()
+        } else {
+            tokenizer
+                .decode(&self.reasoning_tokens, true)
+                .unwrap_or_default()
+        };
         self.sink.send_result(GenerationResult {
             output_token_ids: self.output_tokens.clone(),
-            output_text: tokenizer
-                .decode(&self.output_tokens, true)
-                .unwrap_or_default(),
+            output_text,
+            reasoning_content,
             finish_reason: finish_reason.to_string(),
             prompt_tokens: self.prompt_tokens.len(),
             completion_tokens: self.output_tokens.len(),
+            total_duration_ns,
+            prompt_eval_duration_ns,
+            eval_duration_ns,
         });
         self.finished = true;
+    }
+
+    /// Compute `(total, prompt_eval, eval)` wall times in nanoseconds from the
+    /// captured `start_time` / `prefill_end` instants.
+    ///
+    /// `prompt_eval_duration_ns` covers wall time from admission to the end of
+    /// prefill; `eval_duration_ns` covers the remaining decode time.  When
+    /// prefill never completed (e.g. the sequence failed during prefill), both
+    /// sub-durations are 0 and only `total_duration_ns` is populated.
+    fn timing_ns(&self) -> (u128, u128, u128) {
+        let now = Instant::now();
+        let total_duration_ns = now.duration_since(self.start_time).as_nanos();
+        let (prompt_eval_duration_ns, eval_duration_ns) = match self.prefill_end {
+            Some(end) => {
+                let pe = end.duration_since(self.start_time).as_nanos();
+                let ev = now.duration_since(end).as_nanos();
+                (pe, ev)
+            }
+            None => (0, 0),
+        };
+        (total_duration_ns, prompt_eval_duration_ns, eval_duration_ns)
     }
 
     /// Mark the sequence as failed, free its blocks, and send an error.
@@ -594,7 +729,9 @@ impl ActiveSequence {
         if let (Some(bt), Some(pool)) = (&mut self.block_table, block_pool) {
             bt.free_all(pool);
         }
-        self.sink.send_error(&error, self.prompt_tokens.len());
+        let timing = self.timing_ns();
+        self.sink
+            .send_error(&error, self.prompt_tokens.len(), timing);
         self.finished = true;
     }
 }
@@ -1213,6 +1350,15 @@ impl Engine {
                     Ok(req) => {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        // If the prompt ends with a thinking delimiter (e.g. the
+                        // server injected <|think|> for think=true), the model
+                        // is already "inside" thinking and the first output token
+                        // will be reasoning content, not a delimiter.
+                        if let Some(&last) = seq.prompt_tokens.last() {
+                            if seq.think_filter.is_open_delimiter(last) {
+                                seq.think_filter.set_in_think(true);
+                            }
+                        }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens, batch_size={})",
                             seq.request_id,
@@ -1231,6 +1377,11 @@ impl Engine {
                     Some(req) => {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        if let Some(&last) = seq.prompt_tokens.last() {
+                            if seq.think_filter.is_open_delimiter(last) {
+                                seq.think_filter.set_in_think(true);
+                            }
+                        }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens)",
                             seq.request_id,
@@ -1333,6 +1484,7 @@ impl Engine {
 
                 if !seq.prefilled {
                     seq.prefilled = true;
+                    seq.prefill_end = Some(Instant::now());
                 }
 
                 let finish_reason = check_stop(
@@ -1342,7 +1494,24 @@ impl Engine {
                     &stop_token_ids,
                 );
 
+                // Populate timing on the final streaming chunk so the HTTP
+                // handler doesn't have to measure wall time itself (which
+                // would bake in queueing/transport delay).
+                let (total_ns, prompt_eval_ns, eval_ns) = if finish_reason.is_some() {
+                    let t = seq.timing_ns();
+                    (Some(t.0), Some(t.1), Some(t.2))
+                } else {
+                    (None, None, None)
+                };
+
                 let kind = seq.think_filter.classify(token_id);
+                // Accumulate token into the appropriate bucket for the
+                // non-streaming GenerationResult.
+                match kind {
+                    TokenKind::Reasoning => seq.reasoning_tokens.push(token_id),
+                    TokenKind::Content => seq.content_tokens.push(token_id),
+                    TokenKind::Delimiter => {} // delimiters are dropped
+                }
                 let client_gone = match kind {
                     TokenKind::Delimiter => {
                         // Opening/closing delimiter: drop text, but if this is
@@ -1353,6 +1522,9 @@ impl Engine {
                                 text: String::new(),
                                 reasoning_content: String::new(),
                                 finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
                             });
                         }
                         false
@@ -1365,6 +1537,9 @@ impl Engine {
                             text: String::new(),
                             reasoning_content: text,
                             finish_reason: finish_reason.clone(),
+                            total_duration_ns: total_ns,
+                            prompt_eval_duration_ns: prompt_eval_ns,
+                            eval_duration_ns: eval_ns,
                         })
                     }
                     TokenKind::Content => {
@@ -1375,6 +1550,9 @@ impl Engine {
                             text,
                             reasoning_content: String::new(),
                             finish_reason: finish_reason.clone(),
+                            total_duration_ns: total_ns,
+                            prompt_eval_duration_ns: prompt_eval_ns,
+                            eval_duration_ns: eval_ns,
                         })
                     }
                 };
@@ -1599,6 +1777,9 @@ impl Engine {
                             text: format!("Error: {e}"),
                             reasoning_content: String::new(),
                             finish_reason: Some("error".to_string()),
+                            total_duration_ns: None,
+                            prompt_eval_duration_ns: None,
+                            eval_duration_ns: None,
                         });
                     }
                 }
@@ -1756,6 +1937,9 @@ impl Engine {
                     text: content,
                     reasoning_content: reasoning,
                     finish_reason: finish_reason.clone(),
+                    total_duration_ns: None,
+                    prompt_eval_duration_ns: None,
+                    eval_duration_ns: None,
                 }) {
                     self.free_paged_blocks();
                     return Ok(());
@@ -1767,6 +1951,9 @@ impl Engine {
                     text: String::new(),
                     reasoning_content: String::new(),
                     finish_reason: finish_reason.clone(),
+                    total_duration_ns: None,
+                    prompt_eval_duration_ns: None,
+                    eval_duration_ns: None,
                 });
             }
         }
@@ -1802,6 +1989,9 @@ impl Engine {
                         text: content,
                         reasoning_content: reasoning,
                         finish_reason: finish_reason.clone(),
+                        total_duration_ns: None,
+                        prompt_eval_duration_ns: None,
+                        eval_duration_ns: None,
                     }) {
                         break;
                     }
@@ -1811,6 +2001,9 @@ impl Engine {
                         text: String::new(),
                         reasoning_content: String::new(),
                         finish_reason: finish_reason.clone(),
+                        total_duration_ns: None,
+                        prompt_eval_duration_ns: None,
+                        eval_duration_ns: None,
                     });
                 }
             }
@@ -1837,8 +2030,6 @@ impl Engine {
         prompt_tokens: &[u32],
         sampling_params: &SamplingParams,
     ) -> Result<(GenerationResult, f64, f64)> {
-        use std::time::Instant;
-
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
@@ -1878,7 +2069,11 @@ impl Engine {
                 completion_tokens: output_tokens.len(),
                 output_token_ids: output_tokens,
                 output_text,
+                reasoning_content: String::new(),
                 finish_reason,
+                total_duration_ns: ((prefill_ms + decode_ms) * 1_000_000.0) as u128,
+                prompt_eval_duration_ns: (prefill_ms * 1_000_000.0) as u128,
+                eval_duration_ns: (decode_ms * 1_000_000.0) as u128,
             },
             prefill_ms,
             decode_ms,
