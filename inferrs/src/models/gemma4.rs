@@ -109,9 +109,15 @@ impl PliEmbeddingTable {
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
         let content = gguf_file::Content::read(&mut file)?;
 
-        // Find the PLI embedding tensor.
+        // Find the PLI embedding tensor.  Try both the HF name (inferrs-quantized
+        // GGUFs) and the llama.cpp canonical name (external GGUFs).
         let tensor_name = "model.language_model.embed_tokens_per_layer.weight";
-        let info = match content.tensor_infos.get(tensor_name) {
+        let gguf_tensor_name = "per_layer_token_embd.weight";
+        let info = match content
+            .tensor_infos
+            .get(tensor_name)
+            .or_else(|| content.tensor_infos.get(gguf_tensor_name))
+        {
             Some(t) => t,
             None => return Ok(None),
         };

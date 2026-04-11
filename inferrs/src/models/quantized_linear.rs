@@ -293,6 +293,33 @@ impl QGgufVarBuilder {
             Err(e) => Some(Err(e)),
         }
     }
+
+    /// Re-key all tensors using a mapping function that translates raw GGUF
+    /// tensor names to HF-style names.
+    ///
+    /// Because the lazy loader looks up tensors by name in the GGUF content
+    /// metadata, this method eagerly loads all tensors under their mapped names
+    /// into the shared cache.  Future calls to `qlinear_weight` / `get_qtensor`
+    /// will hit the cache and find the tensor under its HF key.
+    pub fn rename_keys<F: Fn(&str) -> String>(&self, map_fn: F) -> Result<Self> {
+        for tensor_name in self.content.tensor_infos.keys() {
+            let hf_name = map_fn(tensor_name);
+            let needs_insert = {
+                let cache = self.cache.lock().unwrap();
+                !cache.contains_key(&hf_name)
+            };
+            if !needs_insert {
+                continue;
+            }
+            let qt = {
+                let mut file = self.file.lock().unwrap();
+                self.content.tensor(&mut *file, tensor_name, &self.device)?
+            };
+            let mut cache = self.cache.lock().unwrap();
+            cache.entry(hf_name).or_insert_with(|| Arc::new(qt));
+        }
+        Ok(self.clone())
+    }
 }
 
 /// Build a bias-free QLinear layer.

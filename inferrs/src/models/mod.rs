@@ -461,7 +461,7 @@ fn var_builder_from_gguf(
         gguf_path.display()
     );
     let top_keys = content.tensor_infos.keys().take(10).collect::<Vec<_>>();
-    tracing::info!("Top 10 GGUF keys: {:?}", top_keys);
+    tracing::debug!("Top 10 GGUF keys: {:?}", top_keys);
 
     let backend = GgufBackend {
         content,
@@ -474,6 +474,215 @@ fn var_builder_from_gguf(
         dtype,
         device.clone(),
     ))
+}
+
+/// Map a HuggingFace safetensors tensor name to its llama.cpp canonical GGUF
+/// equivalent.  This is the inverse of llama.cpp's `tensor_mapping.py`.
+///
+/// Called from `rename_f` when an external GGUF file is detected (i.e. the file
+/// contains `token_embd.weight` rather than `model.embed_tokens.weight`).
+fn gguf_rename_tensor(name: &str, arch: &ModelArchitecture) -> String {
+    // Architectures that nest under `model.language_model.*`:
+    //   Qwen3.5, Gemma4
+    // All others nest under `model.*`.
+    let layer_prefix = match arch {
+        ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => "model.language_model.",
+        _ => "model.",
+    };
+
+    // ── Top-level tensors ────────────────────────────────────────────────
+
+    // embed_tokens → token_embd
+    let embed_path = format!("{layer_prefix}embed_tokens.weight");
+    if name == embed_path {
+        return "token_embd.weight".into();
+    }
+
+    // final norm → output_norm
+    let norm_path = format!("{layer_prefix}norm.weight");
+    if name == norm_path {
+        return "output_norm.weight".into();
+    }
+
+    // lm_head → output  (only models with untied heads have this tensor)
+    if name == "lm_head.weight" {
+        return "output.weight".into();
+    }
+
+    // ── Gemma4 PLI global tensors ────────────────────────────────────────
+    if matches!(arch, ModelArchitecture::Gemma4) {
+        let pli_prefix = layer_prefix.to_string();
+        if name == format!("{pli_prefix}embed_tokens_per_layer.weight") {
+            return "per_layer_token_embd.weight".into();
+        }
+        if name == format!("{pli_prefix}per_layer_model_projection.weight") {
+            return "per_layer_model_proj.weight".into();
+        }
+        if name == format!("{pli_prefix}per_layer_projection_norm.weight") {
+            return "per_layer_proj_norm.weight".into();
+        }
+    }
+
+    // ── Per-layer tensors ────────────────────────────────────────────────
+    let layers_prefix = format!("{layer_prefix}layers.");
+    if let Some(rest) = name.strip_prefix(&layers_prefix) {
+        // rest = "0.self_attn.q_proj.weight" → idx="0", suffix="self_attn.q_proj.weight"
+        if let Some((idx, suffix)) = rest.split_once('.') {
+            let mapped = gguf_rename_layer_suffix(suffix, arch);
+            return format!("blk.{idx}.{mapped}");
+        }
+    }
+
+    // Unmapped — return as-is (happens for inferrs-internal tensors).
+    name.to_string()
+}
+
+/// Map a single layer suffix (e.g. `self_attn.q_proj.weight`) to its GGUF
+/// equivalent (e.g. `attn_q.weight`).
+fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
+    // ── Attention projections ────────────────────────────────────────────
+    let mapped = match suffix {
+        // Separate Q/K/V (Qwen2/3/3.5, Gemma2/3/4)
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.q_proj.bias" => "attn_q.bias",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.k_proj.bias" => "attn_k.bias",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.v_proj.bias" => "attn_v.bias",
+        // Fused QKV (Phi3)
+        "self_attn.qkv_proj.weight" => "attn_qkv.weight",
+        // Output projection
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "self_attn.o_proj.bias" => "attn_output.bias",
+        // QK-norm (Qwen3, Gemma3, Gemma4)
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
+
+        // ── MLP ──────────────────────────────────────────────────────────
+        "mlp.gate_proj.weight" => "ffn_gate.weight",
+        "mlp.up_proj.weight" => "ffn_up.weight",
+        "mlp.down_proj.weight" => "ffn_down.weight",
+        // Phi3 fused gate_up_proj
+        "mlp.gate_up_proj.weight" => "ffn_up.weight",
+
+        // ── Norms ────────────────────────────────────────────────────────
+        "input_layernorm.weight" => "attn_norm.weight",
+        "post_attention_layernorm.weight" => {
+            // Gemma2/3/4 use this as "post_attention_norm", everyone else as "ffn_norm"
+            match arch {
+                ModelArchitecture::Gemma2
+                | ModelArchitecture::Gemma3
+                | ModelArchitecture::Gemma4 => "post_attention_norm.weight",
+                _ => "ffn_norm.weight",
+            }
+        }
+        // Gemma-specific extra norms
+        "pre_feedforward_layernorm.weight" => "ffn_norm.weight",
+        "post_feedforward_layernorm.weight" => "post_ffw_norm.weight",
+
+        // ── Gemma4 PLI per-layer tensors ─────────────────────────────────
+        "per_layer_input_gate.weight" => "inp_gate.weight",
+        "per_layer_projection.weight" => "proj.weight",
+        "post_per_layer_input_norm.weight" => "post_norm.weight",
+        // layer_scalar is loaded via vb.get(1, "layer_scalar") (no .weight suffix)
+        "layer_scalar" => "layer_output_scale.weight",
+
+        // ── Qwen3.5 linear attention tensors ─────────────────────────────
+        "linear_attn.in_proj_qkv.weight" => "linear_attn_in_proj_qkv.weight",
+        "linear_attn.in_proj_z.weight" => "linear_attn_in_proj_z.weight",
+        "linear_attn.in_proj_a.weight" => "linear_attn_in_proj_a.weight",
+        "linear_attn.in_proj_b.weight" => "linear_attn_in_proj_b.weight",
+        "linear_attn.out_proj.weight" => "linear_attn_out_proj.weight",
+
+        // Fallback: pass through the suffix unchanged so that `blk.{idx}.`
+        // prefix is still applied.  This handles any tensors not explicitly
+        // listed above without causing a lookup failure.
+        other => return other.to_string(),
+    };
+    mapped.to_string()
+}
+
+/// Reverse-map a llama.cpp canonical GGUF tensor name back to its HuggingFace
+/// safetensors equivalent.  Used to re-key `QGgufVarBuilder` data so that
+/// model code looking up HF-style paths can find the right tensors.
+fn gguf_reverse_rename_tensor(gguf_name: &str, arch: &ModelArchitecture) -> String {
+    let layer_prefix = match arch {
+        ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => "model.language_model.",
+        _ => "model.",
+    };
+
+    // ── Top-level tensors ────────────────────────────────────────────────
+    match gguf_name {
+        "token_embd.weight" => return format!("{layer_prefix}embed_tokens.weight"),
+        "output_norm.weight" => return format!("{layer_prefix}norm.weight"),
+        "output.weight" => return "lm_head.weight".into(),
+        _ => {}
+    }
+
+    // ── Gemma4 PLI global tensors ────────────────────────────────────────
+    if matches!(arch, ModelArchitecture::Gemma4) {
+        match gguf_name {
+            "per_layer_token_embd.weight" => {
+                return format!("{layer_prefix}embed_tokens_per_layer.weight")
+            }
+            "per_layer_model_proj.weight" => {
+                return format!("{layer_prefix}per_layer_model_projection.weight")
+            }
+            "per_layer_proj_norm.weight" => {
+                return format!("{layer_prefix}per_layer_projection_norm.weight")
+            }
+            _ => {}
+        }
+    }
+
+    // ── Per-layer tensors: blk.{idx}.{gguf_suffix} ───────────────────────
+    if let Some(rest) = gguf_name.strip_prefix("blk.") {
+        if let Some((idx, gguf_suffix)) = rest.split_once('.') {
+            let hf_suffix = gguf_reverse_layer_suffix(gguf_suffix, arch);
+            return format!("{layer_prefix}layers.{idx}.{hf_suffix}");
+        }
+    }
+
+    gguf_name.to_string()
+}
+
+/// Reverse-map a GGUF block suffix to its HF equivalent.
+fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
+    let mapped = match suffix {
+        "attn_q.weight" => "self_attn.q_proj.weight",
+        "attn_q.bias" => "self_attn.q_proj.bias",
+        "attn_k.weight" => "self_attn.k_proj.weight",
+        "attn_k.bias" => "self_attn.k_proj.bias",
+        "attn_v.weight" => "self_attn.v_proj.weight",
+        "attn_v.bias" => "self_attn.v_proj.bias",
+        "attn_qkv.weight" => "self_attn.qkv_proj.weight",
+        "attn_output.weight" => "self_attn.o_proj.weight",
+        "attn_output.bias" => "self_attn.o_proj.bias",
+        "attn_q_norm.weight" => "self_attn.q_norm.weight",
+        "attn_k_norm.weight" => "self_attn.k_norm.weight",
+        "ffn_gate.weight" => "mlp.gate_proj.weight",
+        "ffn_up.weight" => match arch {
+            ModelArchitecture::Phi3 => "mlp.gate_up_proj.weight",
+            _ => "mlp.up_proj.weight",
+        },
+        "ffn_down.weight" => "mlp.down_proj.weight",
+        "attn_norm.weight" => "input_layernorm.weight",
+        "ffn_norm.weight" => match arch {
+            ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+                "pre_feedforward_layernorm.weight"
+            }
+            _ => "post_attention_layernorm.weight",
+        },
+        "post_attention_norm.weight" => "post_attention_layernorm.weight",
+        "post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
+        "inp_gate.weight" => "per_layer_input_gate.weight",
+        "proj.weight" => "per_layer_projection.weight",
+        "post_norm.weight" => "post_per_layer_input_norm.weight",
+        "layer_output_scale.weight" => "layer_scalar",
+        // Passthrough for unknown suffixes
+        other => return other.to_string(),
+    };
+    mapped.to_string()
 }
 
 /// Load a model from weight files.
@@ -495,42 +704,19 @@ pub fn load_model(
     let vb: VarBuilder<'static> = if let Some(gguf) = gguf_path {
         let mut base_vb = var_builder_from_gguf(gguf, dtype, device)?;
 
-        // Map safetensors names (expected by candle-transformers) back to
-        // Llama.cpp GGUF names if the user downloaded an external GGUF file.
-        if matches!(arch, ModelArchitecture::Phi3)
-            && base_vb.contains_tensor("token_embd.weight")
+        // Map safetensors names (expected by candle-transformers) to the
+        // llama.cpp canonical GGUF names if the user downloaded an external
+        // GGUF file.  Detection: external GGUFs always have `token_embd.weight`
+        // while inferrs-quantized GGUFs retain the original HF names.
+        if base_vb.contains_tensor("token_embd.weight")
             && !base_vb.contains_tensor("model.embed_tokens.weight")
         {
             tracing::info!(
-                "Detected external GGUF format: applying Llama.cpp tensor name mappings for Phi3"
+                "Detected external GGUF format: applying llama.cpp tensor name mappings for {:?}",
+                arch
             );
-            base_vb = base_vb.rename_f(|n: &str| {
-                if n == "model.embed_tokens.weight" {
-                    return "token_embd.weight".to_string();
-                }
-                if n == "model.norm.weight" {
-                    return "output_norm.weight".to_string();
-                }
-                if n == "lm_head.weight" {
-                    return "output.weight".to_string();
-                }
-
-                if let Some(rest) = n.strip_prefix("model.layers.") {
-                    if let Some((idx, suffix)) = rest.split_once('.') {
-                        let replacement = match suffix {
-                            "input_layernorm.weight" => "attn_norm.weight",
-                            "post_attention_layernorm.weight" => "ffn_norm.weight",
-                            "self_attn.qkv_proj.weight" => "attn_qkv.weight",
-                            "self_attn.o_proj.weight" => "attn_output.weight",
-                            "mlp.gate_up_proj.weight" => "ffn_up.weight",
-                            "mlp.down_proj.weight" => "ffn_down.weight",
-                            _ => suffix,
-                        };
-                        return format!("blk.{idx}.{replacement}");
-                    }
-                }
-                n.to_string()
-            });
+            let arch_clone = arch.clone();
+            base_vb = base_vb.rename_f(move |name: &str| gguf_rename_tensor(name, &arch_clone));
         }
 
         base_vb
@@ -540,6 +726,9 @@ pub fn load_model(
         // The VarBuilder (and the model built from it) keep the mmap alive.
         unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? }
     };
+
+    // Detect external GGUF format for QGgufVarBuilder re-keying below.
+    let is_external_gguf = gguf_path.is_some() && vb.contains_tensor("token_embd.weight");
 
     // For Gemma4 loaded from GGUF, also build a QGgufVarBuilder that keeps
     // weights in their quantized form (e.g. Q4K) so that projection layers
@@ -555,6 +744,23 @@ pub fn load_model(
                     tracing::info!(
                         "{arch:?}: using quantized weight projection (QMatMul) for GGUF model"
                     );
+                    // For external GGUFs, re-key from llama.cpp names to HF names
+                    // so that model code can find tensors via HF-style paths.
+                    let qvb = if is_external_gguf {
+                        match qvb
+                            .rename_keys(|gguf_key| gguf_reverse_rename_tensor(gguf_key, arch))
+                        {
+                            Ok(q) => q,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "{arch:?}: failed to re-key QGgufVarBuilder, falling back to dequantized weights: {e}"
+                                );
+                                return None;
+                            }
+                        }
+                    } else {
+                        qvb
+                    };
                     Some(qvb)
                 }
                 Err(e) => {
@@ -663,6 +869,8 @@ pub fn load_model(
             let inner = gemma4::Gemma4Model::new(&config, vb.clone(), qvb.as_ref(), gguf_path)?;
 
             // Load audio encoder if audio_config is present in the model config.
+            // GGUF files typically only contain language model weights, so skip
+            // audio/vision encoder loading if the tensors are absent.
             let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {
                 tracing::info!(
                     "Gemma4 audio encoder: {} layers, hidden={}, output_dims={}",
@@ -670,16 +878,26 @@ pub fn load_model(
                     audio_cfg.hidden_size,
                     audio_cfg.output_proj_dims,
                 );
-                let enc = audio_encoder::AudioEncoder::load(
+                match audio_encoder::AudioEncoder::load(
                     vb.pp("model"),
                     audio_cfg,
                     config.hidden_size,
                     device,
                     dtype,
-                )
-                .context("Failed to load Gemma4 audio encoder")?;
-                tracing::info!("Audio encoder loaded successfully");
-                Some(enc)
+                ) {
+                    Ok(enc) => {
+                        tracing::info!("Audio encoder loaded successfully");
+                        Some(enc)
+                    }
+                    Err(e)
+                        if gguf_path.is_some()
+                            && format!("{e:#}").contains("cannot find tensor") =>
+                    {
+                        tracing::warn!("Audio encoder weights not found in GGUF, skipping: {e:#}");
+                        None
+                    }
+                    Err(e) => return Err(e).context("Failed to load Gemma4 audio encoder"),
+                }
             } else {
                 None
             };
@@ -695,16 +913,30 @@ pub fn load_model(
                             cfg.patch_size,
                             cfg.default_output_length,
                         );
-                        let enc = vision_encoder::VisionEncoder::load(
+                        match vision_encoder::VisionEncoder::load(
                             vb.pp("model"),
                             cfg,
                             config.hidden_size,
                             device,
                             dtype,
-                        )
-                        .context("Failed to load Gemma4 vision encoder")?;
-                        tracing::info!("Vision encoder loaded successfully");
-                        Some(enc)
+                        ) {
+                            Ok(enc) => {
+                                tracing::info!("Vision encoder loaded successfully");
+                                Some(enc)
+                            }
+                            Err(e)
+                                if gguf_path.is_some()
+                                    && format!("{e:#}").contains("cannot find tensor") =>
+                            {
+                                tracing::warn!(
+                                    "Vision encoder weights not found in GGUF, skipping: {e:#}"
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                return Err(e).context("Failed to load Gemma4 vision encoder")
+                            }
+                        }
                     }
                     VisionConfig::Qwen(_) => {
                         tracing::info!(
