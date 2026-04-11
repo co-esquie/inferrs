@@ -3,11 +3,12 @@
 //! Ports `scripts/benchmark.sh` to Rust so that benchmarks are runnable on
 //! macOS, Windows **and** Linux without requiring Bash or Python.
 //!
-//! Default benchmark (3 backends):
+//! Default benchmark (4 backends):
 //!   1. Starts `inferrs serve --quantize` and sends timed requests.
 //!   2. Starts `inferrs serve --turbo-quant=false --quantize` and sends timed requests.
-//!   3. Starts `llama-server -hf <model>` and sends timed requests.
-//!   4. Prints a summary table comparing all three backends.
+//!   3. Starts `inferrs serve` (no quantization, plain BF16) and sends timed requests.
+//!   4. Starts `llama-server -hf <model>` and sends timed requests.
+//!   5. Prints a summary table comparing all four backends.
 //!
 //! DGX Spark benchmark (`--dgx-spark`), runs 5 groups:
 //!   Group 1: llama-server 31B GGUF  vs  inferrs --quantize nvidia/Gemma-4-31B-IT-NVFP4
@@ -60,6 +61,10 @@ struct BenchmarkArgs {
     /// Port for the `inferrs serve --turbo-quant=false --quantize` backend.
     #[arg(long, default_value_t = 8082)]
     inferrs_tq_port: u16,
+
+    /// Port for the `inferrs serve` backend (no quantization, plain BF16).
+    #[arg(long, default_value_t = 8083)]
+    inferrs_nq_port: u16,
 
     /// Port for the `llama-server` backend.
     #[arg(long, default_value_t = 8181)]
@@ -205,9 +210,55 @@ fn main() -> Result<()> {
         summary
     };
 
-    // ── 3. llama-server ─────────────────────────────────────────────────────
+    // ── 3. inferrs serve (no quantization) ──────────────────────────────────
     log_header(&format!(
-        "Benchmark 3/3 — llama-server -hf {}",
+        "Benchmark 3/4 — inferrs serve (no quantize) {}",
+        args.inferrs_model
+    ));
+    let summary_inferrs_nq = {
+        let mut server =
+            start_inferrs(&inferrs_bin, &args.inferrs_model, args.inferrs_nq_port, &[])?;
+        ok(&format!(
+            "inferrs serve (no quantize) started (pid {})",
+            server.id()
+        ));
+
+        let health = format!("http://127.0.0.1:{}/health", args.inferrs_nq_port);
+        if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
+            err(&format!("inferrs serve (no quantize) failed to start: {e}"));
+            let _ = server.kill();
+            let _ = server.wait();
+            bail!("server failed to start");
+        }
+
+        let mut tracker = PeakMemoryTracker::start(server.id());
+        let t_bench = Instant::now();
+        let summary_res = bench_http(
+            "127.0.0.1",
+            args.inferrs_nq_port,
+            args.warmup,
+            args.runs,
+            args.max_tokens,
+            &args.inferrs_model,
+            &prompt,
+        );
+        let elapsed = t_bench.elapsed();
+        let peak_mem_mb = tracker.stop();
+
+        let _ = server.kill();
+        let _ = server.wait();
+        ok(&format!(
+            "inferrs serve (no quantize) stopped  (benchmark took {:.1}s)",
+            elapsed.as_secs_f64()
+        ));
+        let mut summary = summary_res?;
+        summary.peak_mem_mb = peak_mem_mb;
+        summary
+    };
+
+    // ── 4. llama-server ─────────────────────────────────────────────────────
+    log_header(&format!(
+        "Benchmark 4/4 — llama-server -hf {}",
         args.llama_model
     ));
     let summary_llama = {
@@ -254,6 +305,7 @@ fn main() -> Result<()> {
         Some(&summary_llama),
         Some(&summary_inferrs),
         Some(&summary_inferrs_tq),
+        Some(&summary_inferrs_nq),
     );
 
     Ok(())
@@ -1246,6 +1298,7 @@ fn print_summary(
     llama: Option<&BenchSummary>,
     inferrs: Option<&BenchSummary>,
     inferrs_tq: Option<&BenchSummary>,
+    inferrs_nq: Option<&BenchSummary>,
 ) {
     fn fmt(v: Option<f64>, unit: &str) -> String {
         match v {
@@ -1278,6 +1331,13 @@ fn print_summary(
             inferrs_tq.and_then(|s| s.prefill_tps),
             inferrs_tq.and_then(|s| s.decode_tps),
             inferrs_tq.and_then(|s| s.peak_mem_mb),
+        ),
+        (
+            format!("inferrs serve {}", args.inferrs_model),
+            inferrs_nq.and_then(|s| s.ttft_ms),
+            inferrs_nq.and_then(|s| s.prefill_tps),
+            inferrs_nq.and_then(|s| s.decode_tps),
+            inferrs_nq.and_then(|s| s.peak_mem_mb),
         ),
     ];
 

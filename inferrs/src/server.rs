@@ -3954,7 +3954,7 @@ async fn ollama_chat(
                 .map(|_| 98u32)
         });
 
-    let think_enabled = req.think.unwrap_or(think_id.is_some());
+    let think_enabled = req.think.unwrap_or(false);
 
     let mut prompt_tokens = prompt_tokens;
     if think_enabled {

@@ -796,6 +796,12 @@ async fn repl(
 
         println!();
 
+        // Discard any keystrokes the user typed during the streaming response.
+        // While raw mode was disabled the OS echoed and buffered those chars;
+        // without this drain they would replay into the next read_line() call,
+        // printing the input a second time on the following prompt line.
+        flush_pending_input();
+
         messages.push(ApiMessage {
             role: "assistant".to_string(),
             content: assistant_text,
@@ -909,6 +915,26 @@ fn handle_command(
         }
         other => println!("Unknown command: {other}"),
     }
+}
+
+// ─── Input helpers ───────────────────────────────────────────────────────────
+
+/// Discard all keyboard events that were buffered while raw mode was disabled.
+///
+/// During response streaming the terminal runs in cooked mode, so the OS both
+/// echoes and buffers any keystrokes typed by the user.  Without this drain
+/// those buffered events flood back into the next `read_line()` call, causing
+/// the typed text to be printed a second time on the following prompt line.
+fn flush_pending_input() {
+    // Briefly enable raw mode so crossterm can read — and throw away — every
+    // pending event without blocking.
+    if terminal::enable_raw_mode().is_err() {
+        return;
+    }
+    while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        let _ = event::read();
+    }
+    let _ = terminal::disable_raw_mode();
 }
 
 // ─── Raw-mode line reader ────────────────────────────────────────────────────
