@@ -524,7 +524,7 @@ pub fn load_model(
                             "self_attn.o_proj.weight" => "attn_output.weight",
                             "mlp.gate_up_proj.weight" => "ffn_up.weight",
                             "mlp.down_proj.weight" => "ffn_down.weight",
-                            _ => return n.to_string(),
+                            _ => suffix,
                         };
                         return format!("blk.{idx}.{replacement}");
                     }
