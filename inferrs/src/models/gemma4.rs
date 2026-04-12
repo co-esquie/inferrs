@@ -740,11 +740,8 @@ fn split_expert_qtensor(
     for e in 0..num_experts {
         let start = e * bytes_per_expert;
         let end = start + bytes_per_expert;
-        let storage = QStorage::from_data(
-            Cow::Owned(raw[start..end].to_vec()),
-            &Device::Cpu,
-            dtype_q,
-        )?;
+        let storage =
+            QStorage::from_data(Cow::Owned(raw[start..end].to_vec()), &Device::Cpu, dtype_q)?;
         experts.push(Arc::new(QTensor::new(storage, per_expert_shape)?));
     }
     Ok(MoeExpertWeights::Quantized(experts))
@@ -779,7 +776,11 @@ impl Gemma4MoeExperts {
                     // GGUF file doesn't have the tensor; fall back to dense vb path.
                     MoeExpertWeights::Dense(
                         vb.get(
-                            (cfg.num_experts, 2 * cfg.moe_intermediate_size, cfg.hidden_size),
+                            (
+                                cfg.num_experts,
+                                2 * cfg.moe_intermediate_size,
+                                cfg.hidden_size,
+                            ),
                             "gate_up_proj",
                         )?
                         .to_dtype(cfg.dtype)?,
@@ -805,7 +806,11 @@ impl Gemma4MoeExperts {
             // Safetensors path: dense BF16 tensors.
             let gate_up = vb
                 .get(
-                    (cfg.num_experts, 2 * cfg.moe_intermediate_size, cfg.hidden_size),
+                    (
+                        cfg.num_experts,
+                        2 * cfg.moe_intermediate_size,
+                        cfg.hidden_size,
+                    ),
                     "gate_up_proj",
                 )?
                 .to_dtype(cfg.dtype)?;
@@ -815,7 +820,10 @@ impl Gemma4MoeExperts {
                     "down_proj",
                 )?
                 .to_dtype(cfg.dtype)?;
-            (MoeExpertWeights::Dense(gate_up), MoeExpertWeights::Dense(down))
+            (
+                MoeExpertWeights::Dense(gate_up),
+                MoeExpertWeights::Dense(down),
+            )
         };
         Ok(Self {
             gate_up_proj,
@@ -879,9 +887,7 @@ impl Gemma4MoeExperts {
             let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
 
             // gate_up[expert_idx]: [2*intermediate, hidden]
-            let gate_up = self
-                .gate_up_proj
-                .expert_weight(expert_idx, dtype, device)?;
+            let gate_up = self.gate_up_proj.expert_weight(expert_idx, dtype, device)?;
             let gate_up_out = current.matmul(&gate_up.t()?)?; // [n, 2*intermediate]
 
             let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
@@ -919,11 +925,8 @@ impl Gemma4MoeBlock {
     fn new(cfg: &Gemma4Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
         let router =
             Gemma4MoeRouter::new(cfg, vb.pp("router"), qvb.map(|q| q.pp("router")).as_ref())?;
-        let experts = Gemma4MoeExperts::new(
-            cfg,
-            vb.pp("experts"),
-            qvb.map(|q| q.pp("experts")).as_ref(),
-        )?;
+        let experts =
+            Gemma4MoeExperts::new(cfg, vb.pp("experts"), qvb.map(|q| q.pp("experts")).as_ref())?;
         let post_ffw_norm_1 = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -962,7 +965,9 @@ impl Gemma4MoeBlock {
 
         let (top_k_weights, top_k_indices) = self.router.forward(&flat)?;
         let normed_2 = self.pre_ffw_norm_2.forward(&flat)?;
-        let sparse_out = self.experts.forward(&normed_2, &top_k_indices, &top_k_weights)?;
+        let sparse_out = self
+            .experts
+            .forward(&normed_2, &top_k_indices, &top_k_weights)?;
         let sparse_out = sparse_out.reshape(&orig_shape)?;
         let sparse_normed = self.post_ffw_norm_2.forward(&sparse_out)?;
 
@@ -2239,11 +2244,7 @@ impl DecoderLayer {
         let layer_scalar = layer_scalar_raw.to_dtype(cfg.dtype)?;
 
         let moe = if cfg.enable_moe_block {
-            Some(Gemma4MoeBlock::new(
-                cfg,
-                vb.clone(),
-                qvb,
-            )?)
+            Some(Gemma4MoeBlock::new(cfg, vb.clone(), qvb)?)
         } else {
             None
         };
