@@ -17,6 +17,7 @@ use crate::models::attention_utils::{
     paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, PagedCtx, PagedPassCache,
 };
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
+use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 
@@ -547,53 +548,24 @@ impl LinearAttn {
         };
 
         // ── Gated Delta Rule recurrence ───────────────────────────────────────
-        // For each timestep t:
-        //   state = state * g_t                         [decay]
-        //   kv_mem = (state * k_t[:, None, :]).sum(-2)  [read: k_t dot state along head_k_dim]
-        //   delta  = (v_t - kv_mem) * beta_t            [delta correction]
-        //   state += k_t[:, :, None] * delta[:, None, :] [write outer product]
-        //   out_t  = (state * q_t[:, None, :]).sum(-2)  [read output]
-        //
-        // For t=1 (decode) this is one step; for t>1 (prefill) we run the loop
-        // in Rust (dispatches t*n_layers Metal kernels but is numerically exact).
-        let mut outputs = Vec::with_capacity(t);
-
-        for ti in 0..t {
-            // Extract per-timestep slices: [b, n_heads, head_dim]
-            let g_t = g.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads]
-            let beta_t = beta.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads]
-            let q_t = q_f32.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads, head_k_dim]
-            let k_t = k_f32.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads, head_k_dim]
-            let v_t = v_f32.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads, head_v_dim]
-
-            // Decay: state [b, n_heads, hk, hv] *= g_t [b, n_heads] (broadcast)
-            state = state.broadcast_mul(&g_t.unsqueeze(2)?.unsqueeze(3)?)?;
-
-            // Read: kv_mem[b, n_heads, head_v_dim] = sum_over_hk( state * k_t[:,:,None,:] )
-            // k_t: [b, n_h, hk]  →  [b, n_h, hk, 1]
-            // state: [b, n_h, hk, hv]
-            // (state * k_t[...,None]).sum(-2): [b, n_h, hv]
-            let kv_mem = (state.broadcast_mul(&k_t.unsqueeze(3)?)?).sum(candle_core::D::Minus2)?; // [b, n_heads, head_v_dim]
-
-            // Delta: delta[b, n_h, hv] = (v_t - kv_mem) * beta_t
-            // Use broadcast_mul since beta_t is [b, n_h] and diff is [b, n_h, hv]
-            let diff = (v_t - kv_mem)?;
-            let delta = diff.broadcast_mul(&beta_t.unsqueeze(2)?)?; // [b, n_h, hv]
-
-            // Write: state += k_t[:,:,:,None] * delta[:,:,None,:]  (outer product)
-            state = (state + k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?)?;
-
-            // Read output: out_t[b, n_h, hv] = sum_over_hk( state * q_t[:,:,:,None] )
-            let out_t = (state.broadcast_mul(&q_t.unsqueeze(3)?)?).sum(candle_core::D::Minus2)?; // [b, n_h, hv]
-
-            outputs.push(out_t.unsqueeze(1)?); // [b, 1, n_h, hv]
-        }
-
-        // Save state for next call (detach to avoid accumulating graph)
-        self.recurrent_state = Some(state.detach());
-
-        // Stack outputs: [b, t, n_heads, head_v_dim]  (all F32)
-        let out_raw = Tensor::cat(&outputs, 1)?; // [b, t, n_heads, head_v_dim]
+        let out_raw = if t == 1 {
+            // Decode path: single-token sequential step (unchanged)
+            let g_t = g.narrow(1, 0, 1)?.squeeze(1)?;
+            let beta_t = beta.narrow(1, 0, 1)?.squeeze(1)?;
+            let q_t = q_f32.narrow(1, 0, 1)?.squeeze(1)?;
+            let k_t = k_f32.narrow(1, 0, 1)?.squeeze(1)?;
+            let v_t = v_f32.narrow(1, 0, 1)?.squeeze(1)?;
+            let out = sequential_step(&q_t, &k_t, &v_t, &g_t, &beta_t, &mut state)?;
+            self.recurrent_state = Some(state.detach());
+            out.unsqueeze(1)? // [b, 1, n_h, hv]
+        } else {
+            // Prefill path: chunked WY parallel scan
+            // Pass log_g directly (not &g) to avoid log(0)=-inf on CUDA where
+            // subnormal floats are flushed to zero (FTZ mode).
+            let out = gated_delta_rule_chunked(&q_f32, &k_f32, &v_f32, &log_g, &beta, &mut state)?;
+            self.recurrent_state = Some(state.detach());
+            out // already [b, t, n_h, hv]
+        };
 
         // ── Gated RMSNorm: norm(out) * silu(z) ───────────────────────────────
         // Reshape for norm: [b*t*n_heads, head_v_dim]
@@ -796,12 +768,10 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.input_layernorm.forward(x)?;
-
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward(&normed, seqlen_offset, cos, sin)?,
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
-
         let x = (residual + attn_out)?;
         let residual = x.clone();
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -826,13 +796,11 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.input_layernorm.forward(x)?;
-
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward_paged(&normed, seqlen_offset, ctx)?,
             // SSM layers are not paged — use their standard recurrent path.
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
-
         let x = (residual + attn_out)?;
         let residual = x.clone();
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -975,7 +943,7 @@ impl Qwen35Model {
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
 
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut() {
             x = layer.forward(&x, seqlen_offset, &self.cos, &self.sin)?;
         }
 
@@ -1015,7 +983,7 @@ impl Qwen35Model {
         // Track which full-attention layer we are visiting so we index the
         // correct slice of kv_store.
         let mut full_attn_idx = 0usize;
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut() {
             let is_full = matches!(layer.attn, LayerAttn::Full(_));
             let mut ctx = PagedCtx {
                 cos: &self.cos,
