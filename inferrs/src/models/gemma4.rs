@@ -350,6 +350,15 @@ pub struct Gemma4Config {
     pub first_kv_shared_idx: usize,
     /// When `Some(bits)`, KV cache vectors are quantized using TurboQuant at the given bit-width.
     pub turbo_quant_bits: Option<u8>,
+    /// When true, each decoder layer has a MoE FFN in addition to the shared dense MLP.
+    /// Only set for sparse-MoE variants (e.g. Gemma4 26B A4B).
+    pub enable_moe_block: bool,
+    /// Total number of experts (e.g. 128 for Gemma4 26B).
+    pub num_experts: usize,
+    /// Number of experts activated per token (e.g. 8 for Gemma4 26B).
+    pub top_k_experts: usize,
+    /// Hidden dimension inside each expert FFN (smaller than `intermediate_size`).
+    pub moe_intermediate_size: usize,
     pub dtype: DType,
     pub device: Device,
 }
@@ -587,6 +596,9 @@ impl Module for Mlp {
         (lhs * rhs)?.apply(&self.down_proj)
     }
 }
+
+// MoE (Mixture of Experts) components live in a dedicated module.
+use super::gemma4_moe::Gemma4MoeBlock;
 
 // ---------------------------------------------------------------------------
 // KV Cache (normal or rotating)
@@ -1754,6 +1766,8 @@ struct DecoderLayer {
     layer_scalar_f32: Tensor,
     /// PLI fields; `None` for models without per-layer input (e.g. 31B).
     pli: Option<LayerPli>,
+    /// MoE block; `None` for dense models (e.g. 31B).
+    moe: Option<Gemma4MoeBlock>,
 }
 
 impl DecoderLayer {
@@ -1854,6 +1868,12 @@ impl DecoderLayer {
         let layer_scalar_f32 = layer_scalar_raw.to_dtype(DType::F32)?;
         let layer_scalar = layer_scalar_raw.to_dtype(cfg.dtype)?;
 
+        let moe = if cfg.enable_moe_block {
+            Some(Gemma4MoeBlock::new(cfg, vb.clone(), qvb)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             self_attn,
             mlp,
@@ -1864,6 +1884,7 @@ impl DecoderLayer {
             layer_scalar,
             layer_scalar_f32,
             pli,
+            moe,
         })
     }
 
@@ -1986,14 +2007,23 @@ impl DecoderLayer {
             self.pli.is_some(),
             per_layer_input.is_some()
         );
-        // Standard Gemma MLP sub-layer
+        // Standard Gemma MLP sub-layer (shared expert for MoE, or sole FFN for dense).
         let residual = &xs;
-        let mlp_out = self
+        let shared_mlp_out = self
             .pre_feedforward_layernorm
             .forward(&xs)
             .and_then(|n| n.apply(&self.mlp))?;
-        let mlp_out = mlp_out.apply(&self.post_feedforward_layernorm)?;
-        let xs = (residual + mlp_out)?;
+
+        // Dense path: single MLP + post-norm + residual.
+        // MoE path: combine shared MLP with sparse experts, then post-norm + residual.
+        let ffn_out = if let Some(moe) = &self.moe {
+            // MoE: combine shared and sparse branches, then apply post_feedforward_layernorm.
+            let combined = moe.forward(&shared_mlp_out, residual)?;
+            combined.apply(&self.post_feedforward_layernorm)?
+        } else {
+            shared_mlp_out.apply(&self.post_feedforward_layernorm)?
+        };
+        let xs = (residual + ffn_out)?;
 
         // Per-layer input residual path — only for efficient variants (E2B/E4B).
         // Absent on standard models (e.g. 31B) where hidden_size_per_layer_input == 0.
