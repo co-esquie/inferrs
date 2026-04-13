@@ -16,27 +16,14 @@ env:
   CUDA_COMPUTE_CAP: "80"
 
 jobs:
-  fmt:
-    name: Format
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      # Format-check only the packages that don't require GPU toolchains.
-      # inferrs-backend-musa has no MUSA SDK dependency at compile time (it
-      # probes libmusart.so via dlopen at runtime) so it can be checked here.
-      - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install nvcc (needed by candle-kernels build script)
         run: |
@@ -45,8 +32,9 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-      # inferrs-backend-musa is included here for the same reason as fmt: it has
-      # no compile-time MUSA SDK dependency.
+      # inferrs-backend-musa has no compile-time MUSA SDK dependency (it probes
+      # libmusart.so via dlopen at runtime) so it can be checked here.
+      - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
       - run: cargo clippy -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan -- -D warnings
 
   build:
