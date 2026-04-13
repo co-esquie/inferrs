@@ -69,7 +69,3 @@ inferrs serve google/gemma-4-E2B-it
 inferrs serve
 ```
 
-This behaves like `ollama serve` the server starts on `0.0.0.0:17434` and
-exposes the full Ollama API. Any Ollama client — including the `ollama`
-CLI — can point at it directly.
-
