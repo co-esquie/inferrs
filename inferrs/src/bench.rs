@@ -16,7 +16,6 @@ use crate::engine::load_engine;
 use crate::sampler::SamplingParams;
 use crate::util::format_bytes;
 use crate::ServeArgs;
-use inferrs_models::turbo_quant::GROUP_SIZE;
 
 /// Extra options that only apply to the bench subcommand.
 #[derive(clap::Args, Clone)]
@@ -179,18 +178,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
         let (num_kv_heads, head_dim, num_layers) = raw_config.kv_cache_params(&arch);
         // bytes consumed per token across all layers (K + V combined)
         let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant.0 {
-            // TurboQuant: nibble-packed indices + f32 per-group absmax scales
-            let index_bytes = if bits <= 4 {
-                // two indices packed per byte
-                head_dim.div_ceil(2)
-            } else {
-                // one index per byte
-                head_dim
-            };
-            let n_groups = head_dim.div_ceil(GROUP_SIZE);
-            let scale_bytes = n_groups * 4; // f32 per group
-                                            // K and V each have index_bytes + scale_bytes, times num_kv_heads, times num_layers
-            (index_bytes + scale_bytes) * 2 * num_kv_heads * num_layers
+            // PolarQuant: (head_dim-1) packed angle indices + one f32 root norm per token
+            let index_bytes = ((head_dim - 1) * bits as usize).div_ceil(8);
+            let norm_bytes = 4; // one f32 root norm per token vector
+            (index_bytes + norm_bytes) * 2 * num_kv_heads * num_layers
         } else {
             // Regular bf16/f16 or f32 cache
             let bytes_per_element = dtype.size_in_bytes();
