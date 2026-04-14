@@ -1,10 +1,15 @@
-//! Build script: compress `ui/index.html` into `$OUT_DIR/ui.html.gz` using
-//! best-level gzip compression.  The server embeds the result via
+//! Build script for inferrs.
+//!
+//! **Web UI compression** — compress `ui/index.html` into `$OUT_DIR/ui.html.gz`
+//! using best-level gzip compression.  The server embeds the result via
 //! `include_bytes!(concat!(env!("OUT_DIR"), "/ui.html.gz"))` and serves it
 //! with `Content-Encoding: gzip` in daemon mode (no model argument).
-//!
 //! The build fails loudly if the compressed output exceeds 1 MiB so that the
 //! size budget is enforced at compile time rather than discovered at runtime.
+//!
+//! Note: the Go OCI shared library (`libocipull`) is loaded on demand via
+//! `dlopen` at runtime (see `pull.rs`), so no link-time configuration is
+//! needed here.
 
 use flate2::{write::GzEncoder, Compression};
 use std::{env, fs, io::Write, path::PathBuf};
@@ -12,6 +17,10 @@ use std::{env, fs, io::Write, path::PathBuf};
 const SIZE_LIMIT_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 fn main() {
+    // -----------------------------------------------------------------------
+    // 1. Web UI compression
+    // -----------------------------------------------------------------------
+
     // Re-run this script if the UI source changes.
     println!("cargo:rerun-if-changed=ui/index.html");
 

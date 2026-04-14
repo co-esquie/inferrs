@@ -5,6 +5,7 @@ mod engine;
 mod grammar;
 mod hub;
 mod list;
+mod modelpack;
 mod pull;
 mod quantize;
 mod rm;

@@ -14,9 +14,11 @@ pub struct ModelFiles {
     pub config_path: PathBuf,
     pub tokenizer_path: PathBuf,
     pub tokenizer_config_path: Option<PathBuf>,
-    /// Original safetensors shards (always present).
+    /// Original safetensors shards (may be empty when loading a pre-existing
+    /// GGUF from a CNCF ModelPack bundle).
     pub weight_paths: Vec<PathBuf>,
-    /// Path to the quantized GGUF file, populated when `--quantize` was given.
+    /// Path to a GGUF file.  Populated when `--quantize` was given or when
+    /// loading a CNCF ModelPack bundle that contains a GGUF model.
     /// When `Some`, callers should load weights from this GGUF instead of
     /// `weight_paths`.
     pub gguf_path: Option<PathBuf>,
@@ -96,6 +98,42 @@ pub fn download_model(
         || as_path.exists()
     {
         return load_local_model(as_path);
+    }
+
+    // ── OCI model resolution ────────────────────────────────────────────
+    // For OCI references (single word → docker.io/ai, or explicit registry),
+    // first check the Docker Model Runner store (~/.docker/models) for a
+    // cached bundle.  If not found, auto-pull via the Go helper.
+    // This allows `inferrs run gemma3` and `inferrs serve docker.io/org/model`
+    // to work seamlessly — reusing DMR's cache or pulling on demand.
+    if let crate::pull::RefKind::Oci = crate::pull::classify_reference(model_id) {
+        // --revision is only meaningful for HuggingFace references; warn when
+        // it is set to a non-default value for an OCI model so the user knows
+        // it is being ignored.
+        if revision != "main" {
+            tracing::warn!(
+                "--revision '{}' is ignored for OCI model '{}'; \
+                 use an OCI tag instead (e.g. docker.io/org/model:v2)",
+                revision,
+                model_id,
+            );
+        }
+
+        let bundle_path = match crate::pull::oci_bundle_path(model_id) {
+            Some(p) => {
+                tracing::info!(
+                    "Found OCI model in local store: {} → {}",
+                    model_id,
+                    p.display()
+                );
+                p
+            }
+            None => {
+                tracing::info!("OCI model not cached, pulling: {}", model_id);
+                crate::pull::oci_pull_model(model_id)?
+            }
+        };
+        return crate::modelpack::load_bundle(&bundle_path);
     }
 
     tracing::info!("Downloading model {} (revision: {})", model_id, revision);
@@ -403,6 +441,17 @@ pub fn download_and_maybe_quantize(
     if files.weight_paths.is_empty() {
         tracing::warn!(
             "--quantize is ignored for GGUF-only repos (the downloaded GGUF is used as-is)"
+        );
+        return Ok(files);
+    }
+
+    // When the model was loaded from a CNCF ModelPack bundle that already
+    // contains a pre-quantized GGUF, skip the quantization step — the
+    // weights are already in the desired format.
+    if files.gguf_path.is_some() {
+        tracing::info!(
+            "Model already has a GGUF file (e.g. from a ModelPack bundle); \
+             skipping --quantize"
         );
         return Ok(files);
     }
