@@ -13,39 +13,119 @@ use clap::Parser;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
-// FFI declarations — linked against the Go C shared library (libocipull).
+// On-demand loading of the Go OCI shared library (libocipull) via dlopen.
+//
+// The library is NOT linked at build time — it is loaded lazily the first
+// time an OCI operation is requested.  This keeps the inferrs binary small
+// and allows it to start even when the library is absent (HuggingFace models
+// still work; only OCI pulls require the library).
 // ---------------------------------------------------------------------------
 
-extern "C" {
-    /// Pull an OCI model and return the bundle path.
-    /// Returns NULL on error (retrieve with `oci_last_error`).
-    /// Caller must free the returned string with `oci_free_string`.
-    fn oci_pull(reference: *const c_char) -> *mut c_char;
+/// Function-pointer signatures matching the Go C exports in lib.go.
+type FnOciPull = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+type FnOciBundle = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+type FnOciLastError = unsafe extern "C" fn() -> *mut c_char;
+type FnOciFreeString = unsafe extern "C" fn(*mut c_char);
 
-    /// Get the bundle path for an already-pulled model.
-    /// Returns NULL if the model is not in the local store.
-    /// Caller must free the returned string with `oci_free_string`.
-    fn oci_bundle(reference: *const c_char) -> *mut c_char;
+/// Holds the dlopen'd library handle and resolved function pointers.
+struct OciLib {
+    // The Library owns the dlopen handle; dropping it would dlclose.
+    // We keep it alive for the lifetime of the process.
+    _lib: libloading::Library,
+    pull: FnOciPull,
+    bundle: FnOciBundle,
+    last_error: FnOciLastError,
+    free_string: FnOciFreeString,
+}
 
-    /// Return the last error message, or NULL if no error.
-    /// Caller must free the returned string with `oci_free_string`.
-    fn oci_last_error() -> *mut c_char;
+// SAFETY: The Go shared library is thread-safe (uses a mutex internally).
+unsafe impl Send for OciLib {}
+unsafe impl Sync for OciLib {}
 
-    /// Free a string returned by `oci_pull`, `oci_bundle`, or `oci_last_error`.
-    fn oci_free_string(s: *mut c_char);
+/// Lazily loaded library — initialised on first OCI operation.
+static OCI_LIB: OnceLock<Result<OciLib, String>> = OnceLock::new();
+
+/// Platform-specific library filename.
+#[cfg(target_os = "macos")]
+const LIB_NAME: &str = "libocipull.dylib";
+#[cfg(target_os = "linux")]
+const LIB_NAME: &str = "libocipull.so";
+#[cfg(target_os = "windows")]
+const LIB_NAME: &str = "ocipull.dll";
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+const LIB_NAME: &str = "libocipull.so";
+
+/// Try to load the OCI shared library, returning a reference to the resolved
+/// function pointers.  The library is loaded at most once; subsequent calls
+/// return the cached result.
+fn load_oci_lib() -> Result<&'static OciLib, String> {
+    OCI_LIB
+        .get_or_init(try_load_oci_lib)
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+fn try_load_oci_lib() -> Result<OciLib, String> {
+    // Search order:
+    //   1. Same directory as the running executable (typical deployment layout)
+    //   2. System library search path (LD_LIBRARY_PATH, DYLD_LIBRARY_PATH, PATH)
+    let exe_dir_lib = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(LIB_NAME)));
+
+    let lib = if let Some(ref path) = exe_dir_lib {
+        // Try next to the executable first.
+        unsafe { libloading::Library::new(path) }
+            .or_else(|_| unsafe { libloading::Library::new(LIB_NAME) })
+    } else {
+        unsafe { libloading::Library::new(LIB_NAME) }
+    };
+
+    let lib = lib.map_err(|e| {
+        format!(
+            "OCI model operations require {LIB_NAME} but it was not found. \
+             Build it with `make oci-lib` and place it next to the inferrs binary. \
+             (dlopen error: {e})"
+        )
+    })?;
+
+    // Resolve the four exported symbols.
+    unsafe {
+        let pull: FnOciPull = *lib
+            .get::<FnOciPull>(b"oci_pull\0")
+            .map_err(|e| format!("failed to resolve oci_pull: {e}"))?;
+        let bundle: FnOciBundle = *lib
+            .get::<FnOciBundle>(b"oci_bundle\0")
+            .map_err(|e| format!("failed to resolve oci_bundle: {e}"))?;
+        let last_error: FnOciLastError = *lib
+            .get::<FnOciLastError>(b"oci_last_error\0")
+            .map_err(|e| format!("failed to resolve oci_last_error: {e}"))?;
+        let free_string: FnOciFreeString = *lib
+            .get::<FnOciFreeString>(b"oci_free_string\0")
+            .map_err(|e| format!("failed to resolve oci_free_string: {e}"))?;
+
+        Ok(OciLib {
+            _lib: lib,
+            pull,
+            bundle,
+            last_error,
+            free_string,
+        })
+    }
 }
 
 /// Read and free the last error from the Go library.
-fn get_last_oci_error() -> String {
+fn get_last_oci_error(lib: &OciLib) -> String {
     unsafe {
-        let err_ptr = oci_last_error();
+        let err_ptr = (lib.last_error)();
         if err_ptr.is_null() {
             return "unknown error".to_string();
         }
         let msg = CStr::from_ptr(err_ptr).to_string_lossy().into_owned();
-        oci_free_string(err_ptr);
+        (lib.free_string)(err_ptr);
         msg
     }
 }
@@ -151,20 +231,21 @@ pub fn classify_reference(reference: &str) -> RefKind {
 
 /// Pull an OCI model and return its bundle path.
 pub fn oci_pull_model(reference: &str) -> Result<PathBuf> {
+    let lib = load_oci_lib().map_err(|e| anyhow::anyhow!("{e}"))?;
     let c_ref = CString::new(reference).context("OCI reference contains interior NUL byte")?;
 
     tracing::info!("Pulling OCI model: {}", reference);
 
-    let result = unsafe { oci_pull(c_ref.as_ptr()) };
+    let result = unsafe { (lib.pull)(c_ref.as_ptr()) };
 
     if result.is_null() {
-        let err = get_last_oci_error();
+        let err = get_last_oci_error(lib);
         anyhow::bail!("OCI pull failed for '{}': {}", reference, err);
     }
 
     let path_str = unsafe {
         let s = CStr::from_ptr(result).to_string_lossy().into_owned();
-        oci_free_string(result);
+        (lib.free_string)(result);
         s
     };
 
@@ -179,13 +260,14 @@ pub fn oci_pull_model(reference: &str) -> Result<PathBuf> {
 ///
 /// Returns `None` if the model is not in the local store.
 pub fn oci_bundle_path(reference: &str) -> Option<PathBuf> {
+    let lib = load_oci_lib().ok()?;
     let c_ref = CString::new(reference).ok()?;
 
-    let result = unsafe { oci_bundle(c_ref.as_ptr()) };
+    let result = unsafe { (lib.bundle)(c_ref.as_ptr()) };
 
     if result.is_null() {
-        // [4] Log a warning when the lookup fails so silent failures are visible.
-        let err = get_last_oci_error();
+        // Log a warning when the lookup fails so silent failures are visible.
+        let err = get_last_oci_error(lib);
         tracing::warn!(
             "OCI bundle lookup failed for '{}': {}; will attempt pull",
             reference,
@@ -196,7 +278,7 @@ pub fn oci_bundle_path(reference: &str) -> Option<PathBuf> {
 
     let path_str = unsafe {
         let s = CStr::from_ptr(result).to_string_lossy().into_owned();
-        oci_free_string(result);
+        (lib.free_string)(result);
         s
     };
 

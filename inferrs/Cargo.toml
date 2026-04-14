@@ -37,6 +37,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Dynamic library loading (dlopen/LoadLibrary) — used by pull.rs to load the
+# Go OCI shared library (libocipull) on demand instead of linking at build time.
+libloading = "0.8"
+
 # ML / Tensor
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
