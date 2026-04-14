@@ -379,7 +379,8 @@ fn read_hf_base_model(model_id: &str) -> Option<String> {
 /// `Some`, ensure a quantized GGUF is present on disk.
 ///
 /// The GGUF is written next to the safetensors shards in the HF hub cache.
-/// If the file already exists it is reused without re-running the conversion.
+/// If the file already exists and is newer than all base model shards it is
+/// reused without re-running the conversion; otherwise it is regenerated.
 /// Quantization happens on the CPU and can take up to a few minutes for large
 /// models; progress is logged at INFO level.
 ///
@@ -408,13 +409,31 @@ pub fn download_and_maybe_quantize(
 
     let gguf = crate::quantize::gguf_path(&files.weight_paths, dtype);
 
-    if gguf.exists() {
-        tracing::info!("Reusing cached GGUF at {} ({:?})", gguf.display(), dtype);
-    } else {
-        tracing::info!(
-            "Quantizing model to {:?} — this runs once and is then cached…",
-            dtype
-        );
+    // Re-quantize if the GGUF doesn't exist OR any base shard is newer than it.
+    let needs_quantize = match std::fs::metadata(&gguf).and_then(|m| m.modified()) {
+        Ok(gguf_mtime) => {
+            let base_newer = files.weight_paths.iter().any(|shard| {
+                std::fs::metadata(shard)
+                    .and_then(|m| m.modified())
+                    .map(|t| t > gguf_mtime)
+                    .unwrap_or(false)
+            });
+            if base_newer {
+                tracing::info!(
+                    "Base model is newer than cached GGUF at {} ({:?}); re-quantizing…",
+                    gguf.display(),
+                    dtype
+                );
+            } else {
+                tracing::info!("Reusing cached GGUF at {} ({:?})", gguf.display(), dtype);
+            }
+            base_newer
+        }
+        Err(_) => true,
+    };
+
+    if needs_quantize {
+        tracing::info!("Quantizing model to {:?}…", dtype);
         // Write to a temp path then atomically rename so that an interrupted
         // conversion (OOM, Ctrl-C, disk-full) never leaves a truncated file
         // that would be silently reused on the next run.
