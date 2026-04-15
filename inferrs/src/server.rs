@@ -112,6 +112,10 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub repetition_penalty: Option<f64>,
+    /// Number of most-recent tokens to consider for penalties (llama.cpp
+    /// `repeat_last_n`).  0 = disabled.
+    #[serde(default)]
+    pub repeat_last_n: Option<usize>,
     /// OpenAI `frequency_penalty`: penalises tokens proportional to how often
     /// they have appeared in the output so far.  Range [0, 2].
     #[serde(default)]
@@ -615,6 +619,7 @@ pub struct OllamaOptions {
     pub top_k: Option<usize>,
     pub num_predict: Option<usize>,
     pub repeat_penalty: Option<f64>,
+    pub repeat_last_n: Option<usize>,
 
     // ── inferrs model-loading extensions ─────────────────────────────────────
     /// Weight data type: f32, f16, bf16
@@ -1913,6 +1918,7 @@ async fn chat_completions(
         req.top_k,
         req.min_p,
         req.repetition_penalty,
+        req.repeat_last_n,
         req.frequency_penalty,
         req.presence_penalty,
         logit_bias,
@@ -2181,6 +2187,8 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub repetition_penalty: Option<f64>,
     #[serde(default)]
+    pub repeat_last_n: Option<usize>,
+    #[serde(default)]
     pub frequency_penalty: Option<f64>,
     #[serde(default)]
     pub presence_penalty: Option<f64>,
@@ -2275,6 +2283,7 @@ async fn completions(
         req.top_k,
         None, // min_p not in CompletionRequest
         req.repetition_penalty,
+        req.repeat_last_n,
         req.frequency_penalty,
         req.presence_penalty,
         None, // logit_bias not in CompletionRequest yet
@@ -2465,6 +2474,7 @@ async fn anthropic_messages(
         req.top_k,
         None,  // min_p
         None,  // repetition_penalty
+        None,  // repeat_last_n
         None,  // frequency_penalty
         None,  // presence_penalty
         None,  // logit_bias
@@ -2957,6 +2967,7 @@ fn build_sampling_params(
     top_k: Option<usize>,
     min_p: Option<f64>,
     repetition_penalty: Option<f64>,
+    repeat_last_n: Option<usize>,
     frequency_penalty: Option<f64>,
     presence_penalty: Option<f64>,
     logit_bias: Option<std::collections::HashMap<u32, f32>>,
@@ -2974,6 +2985,7 @@ fn build_sampling_params(
         top_k,
         min_p,
         repetition_penalty,
+        repeat_last_n,
         frequency_penalty,
         presence_penalty,
         logit_bias,
@@ -2995,6 +3007,7 @@ fn build_sampling_params_with_grammar(
     top_k: Option<usize>,
     min_p: Option<f64>,
     repetition_penalty: Option<f64>,
+    repeat_last_n: Option<usize>,
     frequency_penalty: Option<f64>,
     presence_penalty: Option<f64>,
     logit_bias: Option<std::collections::HashMap<u32, f32>>,
@@ -3014,6 +3027,7 @@ fn build_sampling_params_with_grammar(
         top_k: top_k.unwrap_or(defaults.top_k),
         min_p: min_p.unwrap_or(defaults.min_p),
         repetition_penalty: repetition_penalty.unwrap_or(defaults.repetition_penalty),
+        repeat_last_n: repeat_last_n.unwrap_or(defaults.repeat_last_n),
         frequency_penalty: frequency_penalty.unwrap_or(defaults.frequency_penalty),
         presence_penalty: presence_penalty.unwrap_or(defaults.presence_penalty),
         logit_bias: logit_bias.unwrap_or_default(),
@@ -3506,6 +3520,7 @@ struct OllamaParamBundle {
     top_k: Option<usize>,
     min_p: Option<f64>,
     repetition_penalty: Option<f64>,
+    repeat_last_n: Option<usize>,
     frequency_penalty: Option<f64>,
     presence_penalty: Option<f64>,
     seed: Option<u64>,
@@ -3523,6 +3538,7 @@ fn ollama_options_to_params(
     let top_k = opts.and_then(|o| o.top_k);
     let min_p = opts.and_then(|o| o.min_p);
     let repetition_penalty = opts.and_then(|o| o.repeat_penalty);
+    let repeat_last_n = opts.and_then(|o| o.repeat_last_n);
     let frequency_penalty = opts.and_then(|o| o.frequency_penalty);
     let presence_penalty = opts.and_then(|o| o.presence_penalty);
     let seed = opts.and_then(|o| o.seed).map(|s| s as u64);
@@ -3540,6 +3556,7 @@ fn ollama_options_to_params(
         top_k,
         min_p,
         repetition_penalty,
+        repeat_last_n,
         frequency_penalty,
         presence_penalty,
         seed,
@@ -3907,6 +3924,7 @@ async fn ollama_generate(
         pb.top_k,
         pb.min_p,
         pb.repetition_penalty,
+        pb.repeat_last_n,
         pb.frequency_penalty,
         pb.presence_penalty,
         pb.logit_bias,
@@ -4247,6 +4265,7 @@ async fn ollama_chat(
         pb.top_k,
         pb.min_p,
         pb.repetition_penalty,
+        pb.repeat_last_n,
         pb.frequency_penalty,
         pb.presence_penalty,
         pb.logit_bias,

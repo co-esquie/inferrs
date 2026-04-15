@@ -62,9 +62,14 @@ pub struct RunArgs {
 
     /// Repetition penalty (llama.cpp style): divides positive logits and
     /// multiplies negative logits of previously-seen tokens.
-    /// 1.0 = disabled (default).  Values around 1.1–1.3 reduce looping.
-    #[arg(long, default_value_t = 1.0)]
+    /// 1.0 = disabled.  Default 1.1 (llama.cpp default).
+    #[arg(long, default_value_t = 1.1)]
     pub repetition_penalty: f64,
+
+    /// Number of most-recent tokens to consider for repetition/frequency
+    /// penalties.  0 = disabled.  Default 64 (llama.cpp default).
+    #[arg(long, default_value_t = 64)]
+    pub repeat_last_n: usize,
 
     /// Frequency penalty (OpenAI style): subtracts `frequency_penalty × count`
     /// from each token's logit, penalising tokens proportional to how often
@@ -178,6 +183,7 @@ struct SamplingParams {
     top_k: usize,
     max_tokens: usize,
     repetition_penalty: f64,
+    repeat_last_n: usize,
     frequency_penalty: f64,
 }
 
@@ -189,6 +195,7 @@ impl SamplingParams {
             top_k: args.top_k,
             max_tokens: args.max_tokens,
             repetition_penalty: args.repetition_penalty,
+            repeat_last_n: args.repeat_last_n,
             frequency_penalty: args.frequency_penalty,
         }
     }
@@ -227,6 +234,8 @@ struct ChatOptions {
     num_predict: usize,
     #[serde(skip_serializing_if = "is_one")]
     repeat_penalty: f64,
+    #[serde(skip_serializing_if = "is_default_repeat_last_n")]
+    repeat_last_n: usize,
     #[serde(skip_serializing_if = "is_zero")]
     frequency_penalty: f64,
 }
@@ -236,6 +245,9 @@ fn is_one(v: &f64) -> bool {
 }
 fn is_zero(v: &f64) -> bool {
     v.abs() < 1e-9
+}
+fn is_default_repeat_last_n(v: &usize) -> bool {
+    *v == 64
 }
 
 /// One NDJSON line from a streaming `/api/chat` response.
@@ -333,6 +345,7 @@ async fn chat_stream(
             top_k: params.top_k,
             num_predict: params.max_tokens,
             repeat_penalty: params.repetition_penalty,
+            repeat_last_n: params.repeat_last_n,
             frequency_penalty: params.frequency_penalty,
         }),
     };
@@ -393,6 +406,9 @@ async fn audio_stream(
     });
     if !is_one(&params.repetition_penalty) {
         body["repetition_penalty"] = serde_json::json!(params.repetition_penalty);
+    }
+    if !is_default_repeat_last_n(&params.repeat_last_n) {
+        body["repeat_last_n"] = serde_json::json!(params.repeat_last_n);
     }
     if !is_zero(&params.frequency_penalty) {
         body["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
@@ -723,6 +739,7 @@ async fn repl(
     let mut top_k = args.top_k;
     let mut max_tokens = args.max_tokens;
     let repetition_penalty = args.repetition_penalty;
+    let repeat_last_n = args.repeat_last_n;
     let frequency_penalty = args.frequency_penalty;
 
     let mut multiline = MultilineState::None;
@@ -828,6 +845,7 @@ async fn repl(
                 top_k,
                 max_tokens,
                 repetition_penalty,
+                repeat_last_n,
                 frequency_penalty,
             },
         )
