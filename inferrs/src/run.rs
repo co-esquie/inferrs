@@ -1,3 +1,10 @@
+// clippy::collapsible_match was tightened in Rust 1.95 to flag
+// `KeyCode::X => { if cond { ... } }` patterns in this file's key-handling
+// match. The explicit inner `if` reads more clearly than a guard on each arm
+// here; silence the lint file-wide until a focused readability refactor is
+// done separately.
+#![allow(clippy::collapsible_match)]
+
 //! Interactive REPL for `inferrs run` — talks to a running `inferrs serve`
 //! daemon via the Ollama-compatible HTTP API, exactly as `ollama run` does.
 //!
