@@ -24,12 +24,24 @@ endif
 # toolkit should build without these make targets (e.g. call `cargo build`
 # directly with an explicit `-p ...` list and no `--features cuda`) to get
 # a CPU-only binary that still probes the runtime backends via dlopen.
+#
+# Architecture gate: on Windows ARM64 running Git Bash / MSYS2, `uname -s`
+# returns something like MINGW64_NT-… (not `Darwin`), so the arch check
+# below is what keeps the CUDA flags off that host.  Linux aarch64 (Jetson /
+# Grace) is intentionally allowed because NVIDIA ships a CUDA toolkit for it.
 ifeq ($(UNAME_S),Darwin)
   CUDA_PKG :=
   CUDA_FEATURES :=
-else
+else ifeq ($(UNAME_S),Linux)
   CUDA_PKG := -p inferrs-backend-cuda
   CUDA_FEATURES := --features inferrs/cuda --features inferrs-multimodal/cuda --features inferrs-kernels/cuda
+else ifeq ($(UNAME_M),x86_64)
+  CUDA_PKG := -p inferrs-backend-cuda
+  CUDA_FEATURES := --features inferrs/cuda --features inferrs-multimodal/cuda --features inferrs-kernels/cuda
+else
+  # Non-x86_64 non-Linux non-Darwin host (e.g. Windows ARM64): no CUDA.
+  CUDA_PKG :=
+  CUDA_FEATURES :=
 endif
 
 # inferrs-backend-metal is only built on macOS (standard Apple SDK, no exotic

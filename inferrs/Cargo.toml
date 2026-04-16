@@ -29,13 +29,13 @@ metal = [
     "inferrs-models/metal",
 ]
 
-# On macOS: always enable Metal (the framework ships with every macOS install
-# so there is no toolchain concern like there is with CUDA) and add libloading
-# to probe for the Vulkan/MoltenVK and OpenVINO plugins at runtime.  The
-# `metal` Cargo feature above is still available for explicit opt-in on other
-# platforms that may gain Metal support later.
+# On macOS always enable Metal: the framework ships with every macOS install
+# so there is no toolchain concern like there is with CUDA.  The `metal`
+# Cargo feature above is still available for explicit opt-in on other
+# platforms that may gain Metal support later.  (libloading is declared
+# unconditionally in [dependencies] below — no target-specific duplicate
+# needed.)
 [target.'cfg(target_os = "macos")'.dependencies]
-libloading = "0.8"
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
 candle-transformers = { workspace = true, features = ["metal"] }
@@ -69,9 +69,9 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 
-# Shared model code + KV cache (workspace-local).  The cuda / metal features
-# are added in the target-specific dependency blocks below so the same
-# candle-core feature set propagates through inferrs-models.
+# Shared model code + KV cache (workspace-local).  `cuda` propagates through
+# the `cuda` Cargo feature defined at the top of this file; `metal` is
+# auto-enabled on macOS via the target-specific block above.
 inferrs-models = { path = "../inferrs-models" }
 
 # Tokenizer
@@ -103,18 +103,11 @@ rustfft = "6"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-# Linux / Android / Windows: libloading for dlopen'ing the backend plugins
-# (CUDA / ROCm / CANN / Hexagon / Vulkan / OpenVINO) at runtime.  Note that
-# CUDA support itself is gated behind the `cuda` Cargo feature — enabling it
-# is what pulls `candle-kernels` (and therefore nvcc / CUDA toolkit) into the
-# build.  Hosts without CUDA tooling should build with the default feature
-# set (no `cuda`) so the binary compiles cleanly and falls back to CPU / a
-# non-CUDA backend plugin at runtime.
-[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))'.dependencies]
-libloading = "0.8"
-
 # Linux / Android: libc for low-level dlopen/dlsym used by the CANN HBM
-# memory query in engine.rs (aclrtGetMemInfo via RTLD_NOLOAD).
+# memory query in engine.rs (aclrtGetMemInfo via RTLD_NOLOAD).  The backend
+# plugin probes themselves reuse the unconditional `libloading` dep declared
+# in [dependencies] above; CUDA toolkit linkage is gated behind the `cuda`
+# Cargo feature.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
