@@ -57,7 +57,7 @@ impl PagedCacheConfig {
         let num_blocks = if bytes_per_block == 0 {
             0
         } else {
-            available / bytes_per_block
+            available.checked_div(bytes_per_block).unwrap_or(0)
         };
         Self {
             block_size,
