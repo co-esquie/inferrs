@@ -750,19 +750,26 @@ impl TurboQuantKvCache {
         // Warmup threshold: keep KV data on-device unquantized until the sequence
         // is long enough for KV bandwidth to dominate over weight bandwidth.
         //
-        // On CUDA (discrete GPU) the KV cache lives in VRAM and every decode step
-        // reads it across PCIe/NVLink.  TurboQuant's 4:1 compression meaningfully
-        // reduces that bandwidth, with the CPU round-trip as a smaller overhead.
-        // Break-even on CUDA is roughly 256–512 tokens.
+        // On CUDA (discrete GPU) the KV cache lives in VRAM.  Early analysis put
+        // the break-even at 256–512 tokens, but measurement with nsys showed
+        // that the per-step CPU round-trip (bf16→f32 widening, FWHT, angle packing,
+        // plus DtoH copies in `compress_tensors`) costs more than the PCIe
+        // bandwidth saved for typical interactive contexts (<8192 tokens).
+        // Worst-case is the first decode step that flushes the prefill warmup
+        // buffer — a noticeable chunk of extra work inside the TTFT window for a
+        // 512-token prompt.
         //
         // On Metal (Apple Silicon unified memory) the KV cache already lives in
         // the same fast LPDDR pool that the GPU uses (M4 Max: ~546 GB/s).  There
         // is no PCIe bottleneck, so TurboQuant's bandwidth saving is negligible
         // while the per-layer CPU dequantization cost (35 layers × 2 tensors for
-        // Gemma4-E2B) dominates.  The break-even point is well above 4096 tokens
-        // in practice — keep data unquantized (warmup) for all typical contexts.
+        // Gemma4-E2B) dominates.
+        //
+        // Both backends therefore keep data unquantized (warmup) for all typical
+        // contexts.  VRAM cost at 8192 tokens ~100 MB on Qwen3.5-0.8B, negligible.
         let warmup_seq_len = match &device {
             candle_core::Device::Metal(_) => 8192,
+            candle_core::Device::Cuda(_) => 8192,
             _ => 256,
         };
 

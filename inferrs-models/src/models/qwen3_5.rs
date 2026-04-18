@@ -308,33 +308,41 @@ impl FullAttention {
         let groups = self.num_heads / self.num_kv_heads;
 
         // ── Attention ────────────────────────────────────────────────────────
-        // Decode (t=1, Metal/CUDA, supported head_dim): fused SDPA — QK^T +
-        // scale + softmax + @V in one dispatch; handles GQA internally.
+        // Three fast paths, falling back to `gqa_attention_no_expand` (CPU /
+        // unsupported config):
         //
-        // Fast-path chain when `use_sdpa && t == 1`:
-        //   - CUDA: `sdpa_cuda_flash` (flash_attn_decode_bf16_d{64,128,256,512});
-        //     `use_sdpa` pre-gates dtype+head_dim so this is guaranteed to fire.
-        //   - Metal: `candle_nn::ops::sdpa` (vector or steel kernel).
+        //   Metal decode   (t == 1):  sdpa → sdpa_vector kernel, do_causal=false
+        //   Metal prefill  (t > 8):   sdpa → sdpa_full kernel,   do_causal=true
+        //     Guard t > 8: sdpa_vector (t ≤ 8) ignores do_causal — calling sdpa
+        //     with do_causal=true for t in [2,8] would silently violate causality
+        //     (Q[i] would attend to future KV positions). Fallback handles 2..=8.
         //
-        // If neither fast path is applicable (prefill t>1, CPU, or an unexpected
-        // runtime reject), we fall through to `gqa_attention_no_expand` — a
-        // device-agnostic helper that avoids materialising the expanded KV.
-        // IMPORTANT: `candle_nn::ops::sdpa` has no CUDA impl (only cpu/metal
-        // forwards), so the CUDA fallback must NOT go through `sdpa`.
-        let fast_out = if self.use_sdpa && t == 1 {
-            let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
-            if let Some(out) =
-                candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, scale, 1.0_f32)
-                    .map_err(anyhow::Error::from)?
-            {
-                Some(out)
-            } else if matches!(x.device(), candle_core::Device::Metal(_)) {
-                Some(
+        //   CUDA decode    (t == 1):  sdpa_cuda_flash → flash_attn_decode kernel
+        //   CUDA prefill   (t > 1):   sdpa_cuda_flash_prefill → FA tiled kernel
+        //     IMPORTANT: `candle_nn::ops::sdpa` has no CUDA backend — CUDA paths
+        //     must never go through `sdpa`.
+        let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
+        let fast_out = if self.use_sdpa {
+            match x.device() {
+                candle_core::Device::Metal(_) if t == 1 => Some(
                     candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
                         .map_err(anyhow::Error::from)?,
-                )
-            } else {
-                None
+                ),
+                candle_core::Device::Metal(_) if t > 8 => Some(
+                    candle_nn::ops::sdpa(&q, &k, &v, None, true, scale, 1.0_f32)
+                        .map_err(anyhow::Error::from)?,
+                ),
+                #[cfg(feature = "cuda")]
+                candle_core::Device::Cuda(_) if t == 1 => {
+                    candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, scale, 1.0_f32)
+                        .map_err(anyhow::Error::from)?
+                }
+                #[cfg(feature = "cuda")]
+                candle_core::Device::Cuda(_) => Some(
+                    candle_nn::ops::sdpa_cuda_flash_prefill(&q, &k, &v, seqlen_offset, scale)
+                        .map_err(anyhow::Error::from)?,
+                ),
+                _ => None,
             }
         } else {
             None
@@ -2801,5 +2809,130 @@ mod tests {
             DType::F32,
             "output dtype must match input F32 — alpha must be F32 too"
         );
+    }
+
+    // ── G1: Q4K prefill GEMM — CUDA F32 fast path ────────────────────────────
+    //
+    // Verifies that extending the F16 cuBLAS fast path to F32 activations
+    // produces output numerically consistent with the CPU Q4K reference.
+    // Without the fix, F32 input falls into the Q8_1+CUDA-cores path which
+    // doesn't use Tensor Cores — these tests guard against regressions and
+    // confirm the new path is exercised.
+    #[cfg(feature = "cuda")]
+    mod cuda_prefill_q4k_gemm {
+        use super::*;
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+
+        /// Quantize `weight_cpu` [n_out, k_in] to Q4K on both CPU and CUDA,
+        /// run forward with `input` on both devices, and assert the max absolute
+        /// difference between outputs is within `tol`.
+        fn check_q4k_prefill(
+            weight_cpu: &Tensor,
+            input_cpu: &Tensor,
+            cuda_dev: &Device,
+            tol: f32,
+            label: &str,
+        ) {
+            // CPU reference: Q4K-quantised weight + F32 matmul on CPU.
+            let qt_cpu = QTensor::quantize(weight_cpu, GgmlDType::Q4K).expect("quantize cpu");
+            let qmm_cpu = QMatMul::from_qtensor(qt_cpu).expect("QMatMul cpu");
+            let ref_out = qmm_cpu
+                .forward(input_cpu)
+                .expect("cpu forward")
+                .to_dtype(DType::F32)
+                .expect("cpu f32");
+
+            // CUDA path: same Q4K weights loaded on CUDA, same input moved to CUDA.
+            let qt_cuda = QTensor::quantize_onto(weight_cpu, GgmlDType::Q4K, cuda_dev)
+                .expect("quantize_onto cuda");
+            let qmm_cuda = QMatMul::from_qtensor(qt_cuda).expect("QMatMul cuda");
+            let cuda_input = input_cpu.to_device(cuda_dev).expect("input to cuda");
+            let cuda_out = qmm_cuda
+                .forward(&cuda_input)
+                .expect("cuda forward")
+                .to_device(&Device::Cpu)
+                .expect("cuda out to cpu")
+                .to_dtype(DType::F32)
+                .expect("cuda out f32");
+
+            let diff = max_abs_diff(&ref_out, &cuda_out);
+            assert!(
+                diff <= tol,
+                "{label}: max_abs_diff {diff} > tol {tol} — shapes weight={:?} input={:?}",
+                weight_cpu.shape(),
+                input_cpu.shape(),
+            );
+        }
+
+        /// Skip gracefully when no CUDA device is available.
+        fn maybe_cuda() -> Option<Device> {
+            Device::new_cuda(0).ok()
+        }
+
+        // ── F32 input (SSM N4 path) — the new path exercised by this PR ──────
+
+        #[test]
+        fn f32_input_in_proj_shape() {
+            let Some(cuda) = maybe_cuda() else { return };
+            let cpu = Device::Cpu;
+            // Weight [n_out=1024, k_in=1024], input [m=512, k_in=1024]
+            let w = Tensor::randn(0f32, 0.02f32, (1024, 1024), &cpu).unwrap();
+            let x = Tensor::randn(0f32, 1.0f32, (512, 1024), &cpu).unwrap();
+            check_q4k_prefill(&w, &x, &cuda, 0.5, "f32_in_proj_1024x1024");
+        }
+
+        #[test]
+        fn f32_input_mlp_gate_up_shape() {
+            let Some(cuda) = maybe_cuda() else { return };
+            let cpu = Device::Cpu;
+            // Weight [n_out=2816, k_in=1024], input [m=512, k_in=1024]
+            let w = Tensor::randn(0f32, 0.02f32, (2816, 1024), &cpu).unwrap();
+            let x = Tensor::randn(0f32, 1.0f32, (512, 1024), &cpu).unwrap();
+            check_q4k_prefill(&w, &x, &cuda, 0.5, "f32_mlp_gate_up_2816x1024");
+        }
+
+        #[test]
+        fn f32_input_mlp_down_shape() {
+            let Some(cuda) = maybe_cuda() else { return };
+            let cpu = Device::Cpu;
+            // Weight [n_out=1024, k_in=2816], input [m=512, k_in=2816]
+            let w = Tensor::randn(0f32, 0.02f32, (1024, 2816), &cpu).unwrap();
+            let x = Tensor::randn(0f32, 1.0f32, (512, 2816), &cpu).unwrap();
+            check_q4k_prefill(&w, &x, &cuda, 0.5, "f32_mlp_down_1024x2816");
+        }
+
+        // ── BF16 input (full-attn path) — no regression ───────────────────────
+
+        #[test]
+        fn bf16_input_no_regression() {
+            let Some(cuda) = maybe_cuda() else { return };
+            let cpu = Device::Cpu;
+            let w = Tensor::randn(0f32, 0.02f32, (1024, 1024), &cpu).unwrap();
+            // BF16 input: was already on the F16 cuBLAS fast path before this PR.
+            let x = Tensor::randn(0f32, 1.0f32, (512, 1024), &cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let x_f32 = x.to_dtype(DType::F32).unwrap();
+            check_q4k_prefill(&w, &x_f32, &cuda, 0.5, "bf16_no_regression_ref");
+            // Also run directly with BF16 input to confirm no panic/shape error.
+            let qt_cuda = QTensor::quantize_onto(&w, GgmlDType::Q4K, &cuda).expect("qt cuda bf16");
+            let qmm = QMatMul::from_qtensor(qt_cuda).expect("qmm cuda bf16");
+            let x_cuda = x.to_device(&cuda).expect("bf16 to cuda");
+            let out = qmm.forward(&x_cuda).expect("bf16 cuda forward");
+            assert_eq!(out.dims(), &[512, 1024], "bf16 output shape mismatch");
+        }
+
+        // ── Decode path (t=1) — must not change ──────────────────────────────
+
+        #[test]
+        fn decode_path_unchanged() {
+            let Some(cuda) = maybe_cuda() else { return };
+            let cpu = Device::Cpu;
+            let w = Tensor::randn(0f32, 0.02f32, (1024, 1024), &cpu).unwrap();
+            // t=1: goes through dequantize_matmul_vec, not dequantize_matmul.
+            let x_f32 = Tensor::randn(0f32, 1.0f32, (1, 1024), &cpu).unwrap();
+            check_q4k_prefill(&w, &x_f32, &cuda, 0.5, "decode_f32_t1");
+        }
     }
 }

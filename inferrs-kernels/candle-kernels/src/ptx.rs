@@ -10,3 +10,5 @@ pub const REDUCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce.ptx"));
 pub const SORT: &str = include_str!(concat!(env!("OUT_DIR"), "/sort.ptx"));
 pub const TERNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/ternary.ptx"));
 pub const UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/unary.ptx"));
+pub const FLASH_ATTN_WMMA: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/flash_attn_wmma.ptx"));

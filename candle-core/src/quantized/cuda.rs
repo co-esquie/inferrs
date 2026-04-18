@@ -1144,7 +1144,10 @@ impl QCudaStorage {
             let data_f32 = self.dequantize(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
-        } else if matches!(storage.dtype(), crate::DType::BF16 | crate::DType::F16)
+        } else if matches!(
+                storage.dtype(),
+                crate::DType::BF16 | crate::DType::F16 | crate::DType::F32
+            )
             && matches!(
                 self.dtype,
                 GgmlDType::Q4_0
@@ -1161,13 +1164,14 @@ impl QCudaStorage {
             )
         {
             // F16 cuBLAS GEMM fast path: dequantize weights to F16 on-device, then
-            // use cuBLAS F16 GEMM.  This is ~2× faster than the Q8_1-quantized GEMM
-            // path on CUDA for batched prefill (b*m > 8 tokens) because:
+            // use cuBLAS F16 GEMM.  Covers BF16, F16, and F32 activations — F32 is
+            // cast to F16 before the GEMM and back after, moving SSM-layer projections
+            // (F32 via N4 routing) from the Q8_1 CUDA-core path to Tensor Cores.
+            // Faster than the Q8_1 path at prefill token counts (b*m > 8) because:
             //   1. cuBLAS F16 GEMM uses tensor cores (16×16 tiles) vs the custom
             //      Q4K+Q8_1 GEMM kernel which runs on CUDA cores.
             //   2. The dequantize_f16 kernel is a single fast GPU-side pass with no
             //      PCIe transfer; its overhead is negligible relative to the GEMM.
-            //   3. We avoid the BF16→F32 conversion kernel that the Q8_1 path needs.
             //
             // The F16 weight buffer is temporary (not cached) — at 31B model scale
             // each projection is ~100 MB but is freed immediately after the GEMM,
@@ -1179,7 +1183,7 @@ impl QCudaStorage {
             // Build layout: contiguous [n, k], then transpose to [k, n].
             let w_layout = crate::Layout::contiguous(crate::Shape::from((n, k)));
             let w_t_layout = w_layout.transpose(0, 1)?;
-            // Convert activation to F16 if it is BF16.
+            // Convert activation to F16 if it is not already F16 (handles BF16 and F32).
             let (act_f16_cow, act_layout_cow);
             let (act_f16, act_layout) = if in_dtype == crate::DType::F16 {
                 (storage, layout)

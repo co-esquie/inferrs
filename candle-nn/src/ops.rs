@@ -1846,3 +1846,18 @@ pub fn sdpa_cuda_flash(
         Ok(None)
     }
 }
+
+/// CUDA flash-attention prefill for t > 1. BF16, head_dim ∈ {128, 256}, causal, GQA.
+///
+/// Returns `[batch, n_q_heads, q_len, head_dim]` BF16.
+/// Errors if preconditions are not satisfied (unlike `sdpa_cuda_flash` which returns `Option`).
+#[cfg(feature = "cuda")]
+pub fn sdpa_cuda_flash_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlen_offset: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    candle::cuda_flash_attn::flash_attn_prefill_cuda(q, k, v, seqlen_offset, scale)
+}
