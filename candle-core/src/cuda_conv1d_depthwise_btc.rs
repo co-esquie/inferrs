@@ -99,7 +99,9 @@ pub fn cuda_conv1d_depthwise_btc(padded: &Tensor, kernel: &Tensor) -> Result<Ten
     builder.arg(&pad_sl);
     builder.arg(&ker_sl);
     builder.arg(&out_buf);
-    unsafe { builder.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+    if n_blocks > 0 {
+        unsafe { builder.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+    }
 
     let cs = crate::CudaStorage::wrap_cuda_slice(out_buf, cuda_dev);
     let shape = crate::Shape::from_dims(&[b, l_out, c]);
