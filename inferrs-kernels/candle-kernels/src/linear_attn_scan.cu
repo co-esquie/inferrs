@@ -1,22 +1,23 @@
-// 3-kernel FLA-style GatedDeltaNet chunked scan (prefill).
+// 5-kernel GatedDeltaNet chunked scan (prefill) — Blelloch parallel state pipeline.
 //
-// Replaces the monolithic per-(batch,head) kernel with three specialised kernels
-// that expose C-level parallelism to the GPU scheduler:
-//
-//   K1  linear_attn_intra   grid(B*NH*C)  — KKT + fwd-subst + WY per chunk
-//   K2  linear_attn_state   grid(B*NH)    — sequential state scan, state in regs
-//   K3  linear_attn_output  grid(B*NH*C)  — tiled qk + matmul per chunk
+//   K1   linear_attn_intra    grid(B*NH*C)        — KKT + fwd-subst + WY per chunk
+//   K2a  linear_attn_ops      grid(B*NH*C)        — per-chunk (A_i, b_i) operators
+//   K2b  linear_attn_scan     variable launches   — Blelloch prefix scan over chunks
+//   K2c  linear_attn_apply    grid(B*NH*C_padded) — reconstruct state, inter/vnew
+//   K3   linear_attn_output   grid(B*NH*C)        — tiled qk + matmul per chunk
 //
 // Intermediate buffers (all F32, allocated by Rust caller):
 //   w    [B*NH*C, S, HK]
 //   u    [B*NH*C, S, HV]
 //   gc   [B*NH*C, S]
-//   inter[B*NH*C, S, HV]   (q_exp @ state snapshot, computed in K2)
-//   vnew [B*NH*C, S, HV]   (u − w @ state, computed in K2)
+//   inter[B*NH*C, S, HV]   (q_exp @ state snapshot, computed in K2c)
+//   vnew [B*NH*C, S, HV]   (u − w @ state, computed in K2c)
 //
 // Public entry points follow the naming convention:
 //   linear_attn_intra_{f32|bf16}_hk{HK}_hv{HV}
-//   linear_attn_state_{f32|bf16}_hk{HK}_hv{HV}
+//   linear_attn_ops_{f32|bf16}_hk{HK}_hv{HV}
+//   linear_attn_scan_{up|down|clear_root}_hk{HK}_hv{HV}
+//   linear_attn_apply_{f32|bf16}_hk{HK}_hv{HV}
 //   linear_attn_output_{f32|bf16}_hk{HK}_hv{HV}
 
 #include <stdint.h>
@@ -241,167 +242,6 @@ static __device__ void linear_attn_intra_impl(
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// K2 — linear_attn_state
-// Grid : (B*NH, 1, 1)   Block : (256, 1, 1)
-//
-// Template params:
-//   HK, HV  — head dims (both supported: 64 or 128, must be equal)
-//   S       — chunk size (64)
-//   HPG     — HK values owned per thread = HK * HV / 256
-//             (64 for HK=HV=128, 16 for HK=HV=64)
-//
-// Thread decomposition (all 256 threads active):
-//   bv_local = tid % HV   — column of state owned by this thread (0..HV-1)
-//   hk_group = tid / HV   — which HPG-wide strip of HK (0..N_GROUPS-1)
-//   N_GROUPS = 256 / HV   — (2 for HV=128, 4 for HV=64)
-//
-//   Each thread holds HPG floats in registers:
-//     state_reg[j] = state[(hk_group*HPG + j), bv_local]  for j=0..HPG-1
-//
-// For HK=HV=128: HPG=64, N_GROUPS=2 → state_reg[64], no idle threads.
-// For HK=HV=64:  HPG=16, N_GROUPS=4 → state_reg[16], no idle threads.
-//
-// Shared memory (~34 KB for HK=HV=128):
-//   s_row       [HK]       — staging for w/k/q rows
-//   s_partial   [256]      — reduction buffer (N_GROUPS * HV = 256, constant)
-//   s_vnew_cache[S * HV]   — cache of the full vnew chunk to avoid S global
-//                            re-reads and S __syncthreads() in Step B
-// ═════════════════════════════════════════════════════════════════════════════
-
-template<int HK, int HV, int S = 64, int HPG = 64, typename T = float>
-static __device__ void linear_attn_state_impl(
-    const float* __restrict__ w,
-    const float* __restrict__ u,
-    const float* __restrict__ gc,
-    const T*     __restrict__ k,
-    const T*     __restrict__ q,
-    float*       __restrict__ state,   // read at start, overwritten at end (in-place)
-    float*       __restrict__ inter,
-    float*       __restrict__ vnew,
-    int C
-) {
-    const int bh  = blockIdx.x;
-    const int tid = threadIdx.x;
-    constexpr int N_GROUPS = 256 / HV;   // number of HK strips
-
-    const int bv_local      = tid % HV;          // 0..HV-1
-    const int hk_group      = tid / HV;          // 0..N_GROUPS-1
-    const int hk_local_base = hk_group * HPG;    // first HK index for this thread
-
-    // HPG floats of state in registers — sized exactly, no waste.
-    float state_reg[HPG];
-
-    extern __shared__ float smem2[];
-    float* const s_row        = smem2;                         // [HK]
-    float* const s_partial    = s_row        + HK;             // [256]  (N_GROUPS * HV)
-    float* const s_vnew_cache = s_partial    + N_GROUPS * HV;  // [S * HV]
-
-    // ── Load state into registers ─────────────────────────────────────────
-    float* my_state = state + (long)bh * HK * HV;
-    for (int j = 0; j < HPG; j++) {
-        state_reg[j] = my_state[(hk_local_base + j) * HV + bv_local];
-    }
-
-    const float* w_bh  = w  + (long)bh * C * S * HK;
-    const float* u_bh  = u  + (long)bh * C * S * HV;
-    const float* gc_bh = gc + (long)bh * C * S;
-    const T*     k_bh  = k  + (long)bh * C * S * HK;
-    const T*     q_bh  = q  + (long)bh * C * S * HK;
-    float* inter_bh    = inter + (long)bh * C * S * HV;
-    float* vnew_bh     = vnew  + (long)bh * C * S * HV;
-
-    for (int ci = 0; ci < C; ci++) {
-        const float* w_ci  = w_bh  + ci * S * HK;
-        const float* u_ci  = u_bh  + ci * S * HV;
-        const float* gc_ci = gc_bh + ci * S;
-        const T*     k_ci  = k_bh  + ci * S * HK;
-        const T*     q_ci  = q_bh  + ci * S * HK;
-        float* inter_ci    = inter_bh + ci * S * HV;
-        float* vnew_ci     = vnew_bh  + ci * S * HV;
-
-        float gc_last = gc_ci[S - 1];
-
-        // ── Step A: inter and vnew ────────────────────────────────────────
-        //
-        // inter[s, bv_local] = exp(gc[s]) * Σ_{j} q[s, hk_local_base+j] * state_reg[j]
-        // vnew[s, bv_local]  = u[s, bv_local] − Σ_{j} w[s, hk_local_base+j] * state_reg[j]
-        //
-        // Both require a reduction over N_GROUPS via s_partial[256].
-        for (int s = 0; s < S; s++) {
-            float gc_s = gc_ci[s];
-
-            // — inter —
-            for (int idx = tid; idx < HK; idx += 256)
-                s_row[idx] = load_as_f32(q_ci + s * HK, idx);
-            __syncthreads();
-
-            float inter_p = 0.0f;
-            for (int j = 0; j < HPG; j++)
-                inter_p += s_row[hk_local_base + j] * state_reg[j];
-            s_partial[hk_group * HV + bv_local] = inter_p * __expf(gc_s);
-            __syncthreads();
-
-            if (hk_group == 0) {
-                float sum = 0.f;
-                for (int g = 0; g < N_GROUPS; g++)
-                    sum += s_partial[g * HV + bv_local];
-                inter_ci[s * HV + bv_local] = sum;
-            }
-            __syncthreads();
-
-            // — vnew —
-            for (int idx = tid; idx < HK; idx += 256)
-                s_row[idx] = w_ci[s * HK + idx];
-            __syncthreads();
-
-            float w_p = 0.0f;
-            for (int j = 0; j < HPG; j++)
-                w_p += s_row[hk_local_base + j] * state_reg[j];
-            s_partial[hk_group * HV + bv_local] = w_p;
-            __syncthreads();
-
-            if (hk_group == 0) {
-                float sum = 0.f;
-                for (int g = 0; g < N_GROUPS; g++)
-                    sum += s_partial[g * HV + bv_local];
-                float vn = u_ci[s * HV + bv_local] - sum;
-                vnew_ci[s * HV + bv_local]        = vn;  // global write (K3 reads)
-                s_vnew_cache[s * HV + bv_local]   = vn;  // smem cache for Step B
-            }
-            __syncthreads();
-        }
-        // s_vnew_cache[S, HV] is now fully populated for this chunk.
-
-        // ── Step B: state update ──────────────────────────────────────────
-        //
-        // state_reg *= exp(gc_last)
-        // for s2 in 0..S: state_reg[j] += k[s2, hk_local_base+j] * decay * vnew[s2, bv_local]
-        //
-        // vnew is read from s_vnew_cache instead of global memory, avoiding S
-        // global loads and S __syncthreads() per chunk.
-        float g_end = __expf(gc_last);
-        for (int j = 0; j < HPG; j++) state_reg[j] *= g_end;
-
-        for (int s2 = 0; s2 < S; s2++) {
-            for (int idx = tid; idx < HK; idx += 256)
-                s_row[idx] = load_as_f32(k_ci + s2 * HK, idx);
-            __syncthreads();
-
-            float decay = __expf(gc_last - gc_ci[s2]);
-            float vn    = s_vnew_cache[s2 * HV + bv_local];
-            for (int j = 0; j < HPG; j++)
-                state_reg[j] += s_row[hk_local_base + j] * decay * vn;
-            __syncthreads();
-        }
-    } // end chunk loop
-
-    // ── Write updated state back in-place ────────────────────────────────
-    for (int j = 0; j < HPG; j++) {
-        my_state[(hk_local_base + j) * HV + bv_local] = state_reg[j];
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
 // K3 — linear_attn_output
 // Grid : (B*NH*C, 1, 1)   Block : (256, 1, 1)
 //
@@ -540,9 +380,8 @@ static __device__ void linear_attn_output_impl(
 //   K2: (HK + 256 + S*HV)*4             = (128 + 256 + 8192)*4 = 34304 B (~34 KB, fits in default 48 KB)
 //   K3: S*S*4 + 2*S*BK*4 + S*4         = 16384 + 32768 + 256  = 49408 B (~49 KB, needs 96 KB carveout)
 
-#define K1_SMEM(S, BK)      ((S)*(S)*4 + 2*(S)*4 + 2*(S)*(BK)*4)
-#define K2_SMEM(HK, HV, S)  (((HK) + 256 + (S)*(HV))*4)
-#define K3_SMEM(S, BK)      ((S)*(S)*4 + 2*(S)*(BK)*4 + (S)*4)
+#define K1_SMEM(S, BK)  ((S)*(S)*4 + 2*(S)*4 + 2*(S)*(BK)*4)
+#define K3_SMEM(S, BK)  ((S)*(S)*4 + 2*(S)*(BK)*4 + (S)*4)
 
 // ── K1 ───────────────────────────────────────────────────────────────────────
 
@@ -572,29 +411,6 @@ DEF_INTRA_KERNEL(f32,  64,  64,  float)
 DEF_INTRA_KERNEL(f32,  128, 128, float)
 DEF_INTRA_KERNEL(bf16, 64,  64,  __nv_bfloat16)
 DEF_INTRA_KERNEL(bf16, 128, 128, __nv_bfloat16)
-
-// ── K2 ───────────────────────────────────────────────────────────────────────
-
-// HPG = HK * HV / 256  (hk values per thread, ensures all 256 threads active)
-//   (64,64):   HPG = 64*64/256 = 16
-//   (128,128): HPG = 128*128/256 = 64
-#define DEF_STATE_KERNEL(DTYPE_NAME, HK_VAL, HV_VAL, HPG_VAL, T_TYPE)        \
-extern "C" __global__                                                         \
-__launch_bounds__(256, 2)                                                     \
-void linear_attn_state_##DTYPE_NAME##_hk##HK_VAL##_hv##HV_VAL(              \
-    const float* w,  const float* u,  const float* gc,                       \
-    const T_TYPE* k, const T_TYPE* q,                                         \
-    float* state,                                                             \
-    float* inter, float* vnew, int C                                          \
-) {                                                                           \
-    linear_attn_state_impl<HK_VAL, HV_VAL, 64, HPG_VAL, T_TYPE>(            \
-        w, u, gc, k, q, state, inter, vnew, C);                              \
-}
-
-DEF_STATE_KERNEL(f32,  64,  64,  16, float)
-DEF_STATE_KERNEL(f32,  128, 128, 64, float)
-DEF_STATE_KERNEL(bf16, 64,  64,  16, __nv_bfloat16)
-DEF_STATE_KERNEL(bf16, 128, 128, 64, __nv_bfloat16)
 
 // ── K3 ───────────────────────────────────────────────────────────────────────
 
@@ -1157,14 +973,22 @@ static __device__ void linear_attn_scan_down_impl(
 //   state_0   : [HK, HV] — initial state (read-only)
 //   w_ci, u_ci, gc_ci, q_ci, k_ci — per-chunk data
 //
-// Thread decomposition: same as K2 (bv_local=tid%HV, hk_group=tid/HV, HPG regs)
+// Thread decomposition:
+//   bv_local      = tid % HV          — HV column in [0, HV)
+//   hk_group      = tid / HV          — group index in [0, N_GROUPS)
+//   hk_local_base = hk_group * HPG    — first HK row owned by this thread
+//
+//   For HK=HV=128, N_GROUPS=2, HPG=64: groups 0/1 own rows 0-63/64-127.
+//   For HK=HV=64,  N_GROUPS=4, HPG=16: groups 0-3 own rows 0-15/16-31/32-47/48-63.
+//
+// Cross-group reduction uses s_partial[256] + __syncthreads() — see Step 2.
 //
 // Shared memory:
-//   s_p_tile  [HK, BK]  — full-HK column tile of P_buf (all groups share one load)
-//   s_st_tile [BK, HV]  — row tile of state_0 (all columns, avoids per-group aliasing)
+//   s_p_tile  [HK, BK]  — column tile of P_buf (BK=16)
+//   s_st_tile [BK, HV]  — row tile of state_0
 //   s_gc      [S]       — gc values
 //   s_row_qw  [HK]      — staging for q/w rows
-//   s_partial [256]     — cross-group reduction
+//   s_partial [256]     — per-thread partial sums for cross-group reduce
 // ═════════════════════════════════════════════════════════════════════════════
 
 template<int HK, int HV, int S = 64, int HPG = 64, int BK = 16, typename T = float>
@@ -1192,6 +1016,7 @@ static __device__ void linear_attn_apply_impl(
     const long bh = bh_chunk / C_padded;
 
     constexpr int N_GROUPS = 256 / HV;
+
     const int bv_local      = tid % HV;
     const int hk_group      = tid / HV;
     const int hk_local_base = hk_group * HPG;
@@ -1224,20 +1049,16 @@ static __device__ void linear_attn_apply_impl(
     __syncthreads();
 
     // ── Step 1: state_in = P[ci] @ state_0 + q_prefix ─────────────────────
-    // All thread groups cooperatively load full-HK tiles so every group reads
-    // from its correct row range — the old per-group s_tile caused groups to
-    // overwrite each other's entries (aliased indices) and s_row_st held a
-    // diagonal of the state rather than a single column.
     for (int j = 0; j < HPG; j++) state_reg[j] = 0.f;
 
     for (int kt = 0; kt < HK; kt += BK) {
-        // Load P_ci[:, kt:kt+BK] into s_p_tile[HK, BK] — all groups collaborate
+        // Load P_ci[:, kt:kt+BK] into s_p_tile[HK, BK] — all threads collaborate
         for (int idx = tid; idx < HK * BK; idx += 256) {
             int r = idx / BK;
             int c = kt + idx % BK;
             s_p_tile[idx] = (c < HK) ? P_ci[r * HK + c] : 0.f;
         }
-        // Load state_0[kt:kt+BK, :] into s_st_tile[BK, HV] — all groups collaborate
+        // Load state_0[kt:kt+BK, :] into s_st_tile[BK, HV] — all threads collaborate
         for (int idx = tid; idx < BK * HV; idx += 256) {
             int kk = idx / HV;
             int bv = idx % HV;
@@ -1260,11 +1081,11 @@ static __device__ void linear_attn_apply_impl(
         state_reg[j] += q_prefix[(hk_local_base + j) * HV + bv_local];
     }
 
-    // ── Step 2: inter and vnew (Step A — same as K2) ──────────────────────
+    // ── Step 2: inter and vnew via s_partial smem reduction ──────────────────
     for (int s = 0; s < S; s++) {
         float gc_s = s_gc_local[s];
 
-        // inter
+        // Load q row for inter
         for (int idx = tid; idx < HK; idx += 256)
             s_row_qw[idx] = load_as_f32(q_ci + s * HK, idx);
         __syncthreads();
@@ -1272,9 +1093,9 @@ static __device__ void linear_attn_apply_impl(
         float inter_p = 0.0f;
         for (int j = 0; j < HPG; j++)
             inter_p += s_row_qw[hk_local_base + j] * state_reg[j];
-        s_partial[hk_group * HV + bv_local] = inter_p * __expf(gc_s);
+        inter_p *= __expf(gc_s);
+        s_partial[tid] = inter_p;
         __syncthreads();
-
         if (hk_group == 0) {
             float sum = 0.f;
             for (int g = 0; g < N_GROUPS; g++)
@@ -1283,7 +1104,7 @@ static __device__ void linear_attn_apply_impl(
         }
         __syncthreads();
 
-        // vnew
+        // Load w row for vnew
         for (int idx = tid; idx < HK; idx += 256)
             s_row_qw[idx] = w_ci[s * HK + idx];
         __syncthreads();
@@ -1291,21 +1112,18 @@ static __device__ void linear_attn_apply_impl(
         float w_p = 0.0f;
         for (int j = 0; j < HPG; j++)
             w_p += s_row_qw[hk_local_base + j] * state_reg[j];
-        s_partial[hk_group * HV + bv_local] = w_p;
+        s_partial[tid] = w_p;
         __syncthreads();
-
         if (hk_group == 0) {
-            float sum = 0.f;
+            float sum_w = 0.f;
             for (int g = 0; g < N_GROUPS; g++)
-                sum += s_partial[g * HV + bv_local];
-            vnew_ci[s * HV + bv_local] = u_ci[s * HV + bv_local] - sum;
+                sum_w += s_partial[g * HV + bv_local];
+            vnew_ci[s * HV + bv_local] = u_ci[s * HV + bv_local] - sum_w;
         }
         __syncthreads();
     }
 
     // ── Step 3: For ci==C_real-1, compute new_state via Step B ─────────────
-    // new_state = A_{C-1} @ state_in + b_{C-1}
-    // But we don't have A_{C-1}/b_{C-1} separately — we have the raw state update:
     // new_state = exp(gc_last)*state_in + sum_s k_d[s] * decay * vnew[s]
     if (ci == C_real - 1) {
         float gc_last = s_gc_local[S - 1];
@@ -1398,7 +1216,7 @@ static __device__ void linear_attn_scan_init_impl(
 
 #define DEF_OPS_KERNEL(DTYPE_NAME, HK_VAL, HV_VAL, T_TYPE)                     \
 extern "C" __global__                                                           \
-__launch_bounds__(256, 2)                                                       \
+__launch_bounds__(256, 4)                                                       \
 void linear_attn_ops_##DTYPE_NAME##_hk##HK_VAL##_hv##HV_VAL(                  \
     const float* w,  const float* u,  const float* gc,                         \
     const T_TYPE* k,                                                            \
@@ -1413,9 +1231,9 @@ DEF_OPS_KERNEL(f32,  128, 128, float)
 DEF_OPS_KERNEL(bf16, 64,  64,  __nv_bfloat16)
 DEF_OPS_KERNEL(bf16, 128, 128, __nv_bfloat16)
 
-#define DEF_SCAN_UP_KERNEL(HK_VAL, HV_VAL)                                     \
+#define DEF_SCAN_UP_KERNEL(HK_VAL, HV_VAL, BOUNDS_MIN)                        \
 extern "C" __global__                                                           \
-__launch_bounds__(256, 2)                                                       \
+__launch_bounds__(256, BOUNDS_MIN)                                              \
 void linear_attn_scan_up_hk##HK_VAL##_hv##HV_VAL(                             \
     float* P_buf, float* q_buf, float* A_buf, float* b_buf,                    \
     int stride, int C_padded                                                    \
@@ -1424,12 +1242,12 @@ void linear_attn_scan_up_hk##HK_VAL##_hv##HV_VAL(                             \
         P_buf, q_buf, A_buf, b_buf, stride, C_padded);                        \
 }
 
-DEF_SCAN_UP_KERNEL(64,  64)
-DEF_SCAN_UP_KERNEL(128, 128)
+DEF_SCAN_UP_KERNEL(64,  64,  6)   // 6 * 16 KB = 96 KB
+DEF_SCAN_UP_KERNEL(128, 128, 4)   // 4 * 24 KB = 96 KB
 
 #define DEF_SCAN_DOWN_KERNEL(HK_VAL, HV_VAL)                                   \
 extern "C" __global__                                                           \
-__launch_bounds__(256, 2)                                                       \
+__launch_bounds__(256, 8)                                                       \
 void linear_attn_scan_down_hk##HK_VAL##_hv##HV_VAL(                           \
     float* P_buf, float* q_buf,                                                \
     const float* A_buf, const float* b_buf,                                    \
@@ -1444,7 +1262,7 @@ DEF_SCAN_DOWN_KERNEL(128, 128)
 
 #define DEF_CLEAR_ROOT_KERNEL(HK_VAL, HV_VAL)                                  \
 extern "C" __global__                                                           \
-__launch_bounds__(256, 2)                                                       \
+__launch_bounds__(256, 8)                                                       \
 void linear_attn_scan_clear_root_hk##HK_VAL##_hv##HV_VAL(                     \
     float* P_buf, float* q_buf, int C_real, int C_padded                        \
 ) {                                                                             \
@@ -1455,23 +1273,23 @@ void linear_attn_scan_clear_root_hk##HK_VAL##_hv##HV_VAL(                     \
 DEF_CLEAR_ROOT_KERNEL(64,  64)
 DEF_CLEAR_ROOT_KERNEL(128, 128)
 
-#define DEF_APPLY_KERNEL(DTYPE_NAME, HK_VAL, HV_VAL, HPG_VAL, T_TYPE)         \
-extern "C" __global__                                                           \
-__launch_bounds__(256, 2)                                                       \
-void linear_attn_apply_##DTYPE_NAME##_hk##HK_VAL##_hv##HV_VAL(                \
-    const float* w,  const float* u,  const float* gc,                         \
-    const T_TYPE* q_tensor, const T_TYPE* k,                                   \
-    const float* state_0, float* new_state,                                    \
-    const float* P_buf, const float* q_buf,                                    \
-    float* inter, float* vnew,                                                 \
-    int C_real, int C_padded                                                    \
-) {                                                                             \
-    linear_attn_apply_impl<HK_VAL, HV_VAL, 64, HPG_VAL, 16, T_TYPE>(          \
-        w, u, gc, q_tensor, k, state_0, new_state, P_buf, q_buf,              \
-        inter, vnew, C_real, C_padded);                                        \
+#define DEF_APPLY_KERNEL(DTYPE_NAME, HK_VAL, HV_VAL, HPG_VAL, T_TYPE, BOUNDS_MIN) \
+extern "C" __global__                                                              \
+__launch_bounds__(256, BOUNDS_MIN)                                                 \
+void linear_attn_apply_##DTYPE_NAME##_hk##HK_VAL##_hv##HV_VAL(                   \
+    const float* w,  const float* u,  const float* gc,                            \
+    const T_TYPE* q_tensor, const T_TYPE* k,                                      \
+    const float* state_0, float* new_state,                                       \
+    const float* P_buf, const float* q_buf,                                       \
+    float* inter, float* vnew,                                                    \
+    int C_real, int C_padded                                                       \
+) {                                                                                \
+    linear_attn_apply_impl<HK_VAL, HV_VAL, 64, HPG_VAL, 16, T_TYPE>(             \
+        w, u, gc, q_tensor, k, state_0, new_state, P_buf, q_buf,                 \
+        inter, vnew, C_real, C_padded);                                           \
 }
 
-DEF_APPLY_KERNEL(f32,  64,  64,  16, float)
-DEF_APPLY_KERNEL(f32,  128, 128, 64, float)
-DEF_APPLY_KERNEL(bf16, 64,  64,  16, __nv_bfloat16)
-DEF_APPLY_KERNEL(bf16, 128, 128, 64, __nv_bfloat16)
+DEF_APPLY_KERNEL(f32,  64,  64,  16, float,          2)   // 2 * 9.75 KB = 19.5 KB
+DEF_APPLY_KERNEL(f32,  128, 128, 64, float,          2)   // 2 * 18.0 KB = 36.0 KB
+DEF_APPLY_KERNEL(bf16, 64,  64,  16, __nv_bfloat16,  2)
+DEF_APPLY_KERNEL(bf16, 128, 128, 64, __nv_bfloat16,  2)

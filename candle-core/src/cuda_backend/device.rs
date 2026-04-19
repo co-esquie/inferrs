@@ -148,11 +148,24 @@ impl CudaFunc {
     pub fn builder(&self) -> cudarc::driver::LaunchArgs<'_> {
         self.stream.launch_builder(&self.func)
     }
+
+    /// Like [`builder`] but targets an explicit stream instead of the device's default stream.
+    pub fn builder_on_stream<'a>(
+        &'a self,
+        stream: &'a cudarc::driver::CudaStream,
+    ) -> cudarc::driver::LaunchArgs<'a> {
+        stream.launch_builder(&self.func)
+    }
 }
 
 impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
+    }
+
+    /// Create a new non-blocking (capturable) CUDA stream on this device.
+    pub fn new_stream(&self) -> Result<Arc<cudarc::driver::CudaStream>> {
+        self.context.new_stream().w()
     }
 
     /// When turned on, all cuda tensors **created after calling this function** will
